@@ -187,6 +187,7 @@ PROPERTIES
   <property name="build-palo.dir" value="${build.dir}/palo"/>
   <property name="build-quick.dir" value="${build.dir}/quick"/>
   <property name="build-pack.dir" value="${build.dir}/pack"/>
+  <property name="build-osgi.dir" value="${build.dir}/osgi"/>
   <property name="build-strap.dir" value="${build.dir}/strap"/>
   <property name="build-docs.dir" value="${build.dir}/scaladoc"/>
   <property name="build-libs.dir" value="${build.dir}/libs"/>
@@ -244,6 +245,15 @@ INITIALISATION
     <path id="maven-ant-tasks.classpath" path="${lib.dir}/ant/maven-ant-tasks-2.1.1.jar" />
     <typedef resource="org/apache/maven/artifact/ant/antlib.xml" uri="urn:maven-artifact-ant" classpathref="maven-ant-tasks.classpath" />
 
+    <property name="init.maven.tasks.finished" value="true" />
+  </target>
+
+  <target name="init.extra.tasks" depends="init.maven.tasks" unless="init.extra.tasks.finished">
+    <artifact:dependencies pathId="extra.tasks.classpath" filesetId="extra.tasks.fileset">
+      <dependency groupId="biz.aQute" artifactId="bnd" version="0.0.384"/>
+    </artifact:dependencies>
+    <!-- BND support -->
+    <typedef resource="aQute/bnd/ant/taskdef.properties" classpathref="extra.tasks.classpath" />
     <property name="init.maven.tasks.finished" value="true" />
   </target>
 
@@ -333,7 +343,7 @@ INITIALISATION
 
   <target name="init.version.done" depends="init.version.release, init.version.snapshot"/>
 
-  <target name="init" depends="init.jars, init.maven.jars, init.version.done">
+  <target name="init" depends="init.jars, init.maven.jars, init.version.done, init.extra.tasks">
     <property name="scalac.args.always" value="-Xmacros" />
   <!-- scalac.args.optimise is selectively overridden in certain antcall tasks. -->
     <property name="scalac.args.optimise" value=""/>
@@ -1269,6 +1279,50 @@ PACKED QUICK BUILD (PACK)
   </target>
 
 <!-- ===========================================================================
+OSGi Artifacts
+============================================================================ -->
+
+  <target name="osgi.init" depends="pack.done">
+    <mkdir dir="${build-osgi.dir}"/>
+  </target>
+
+  <target name="osgi.lib" depends="osgi.init">
+        <bnd classpath="${build-pack.dir}/lib/scala-library.jar" 
+             eclipse="false" 
+             failok="false" 
+             exceptions="true" 
+             files="${src.dir}/build/bnd/scala-library.bnd"
+             output="${build-osgi.dir}"/> 
+        <bnd classpath="${build-pack.dir}/lib/scala-actors.jar" 
+             eclipse="false" 
+             failok="false" 
+             exceptions="true" 
+             files="${src.dir}/build/bnd/scala-actors.bnd"
+             output="${build-osgi.dir}"/> 
+        <bnd classpath="${build-pack.dir}/lib/scala-swing.jar" 
+             eclipse="false" 
+             failok="false" 
+             exceptions="true" 
+             files="${src.dir}/build/bnd/scala-swing.bnd"
+             output="${build-osgi.dir}"/> 
+  </target>
+
+  <target name="osgi.comp" depends="osgi.init">
+        <bnd classpath="${build-pack.dir}/lib/scala-compiler.jar" 
+             eclipse="false" 
+             failok="false" 
+             exceptions="true" 
+             files="${src.dir}/build/bnd/scala-compiler.bnd"
+             output="${build-osgi.dir}"/> 
+  </target>
+
+  <target name="osgi.done" depends="osgi.lib, osgi.comp"/>
+
+  <target name="osgi.clean">
+    <delete dir="${build-osgi.dir}" includeemptydirs="yes" quiet="yes" failonerror="no"/>
+  </target>
+
+<!-- ===========================================================================
 BOOTSTRAPPING BUILD (STRAP)
 ============================================================================ -->
 
@@ -2171,7 +2225,7 @@ TEST AND DISTRIBUTION BUNDLE (ALL)
 
   <target name="all.done" depends="dist.done, test.done"/>
 
-  <target name="all.clean" depends="locker.clean, docs.clean, dist.clean"/>
+  <target name="all.clean" depends="locker.clean, docs.clean, dist.clean, osgi.clean"/>
 
 <!-- ===========================================================================
 STABLE REFERENCE (STARR)

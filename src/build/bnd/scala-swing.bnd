@@ -1,0 +1,4 @@
+Bundle-Name: Scala Swing
+Bundle-SymbolicName: org.scala-lang.scala-swing
+Bundle-Version: 2.10.0
+Export-Package: *

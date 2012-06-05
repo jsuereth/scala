@@ -1,0 +1,4 @@
+Bundle-Name: Scala Standard Library
+Bundle-SymbolicName: org.scala-lang.scala-library
+Bundle-Version: 2.10.0
+Export-Package: *

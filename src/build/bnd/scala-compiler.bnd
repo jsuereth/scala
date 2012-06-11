@@ -1,4 +1,6 @@
 Bundle-Name: Scala Compiler
 Bundle-SymbolicName: org.scala-lang.scala-compiler
-Bundle-Version: 2.10.0
-Export-Package: *
+ver: 2.10.0
+Bundle-Version: ${ver}
+Export-Package: *;version=${ver}
+Import-Package: scala.tools.jline;optional=true, *

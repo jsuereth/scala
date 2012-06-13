@@ -3,4 +3,4 @@ Bundle-SymbolicName: org.scala-lang.scala-library
 ver: 2.10.0
 Bundle-Version: ${ver}
 Export-Package: *;version=${ver}
-Import-Package: sun.misc;optional=true, *
+Import-Package: sun.misc;resolution:=optional, *

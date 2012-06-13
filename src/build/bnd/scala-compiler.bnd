@@ -3,4 +3,4 @@ Bundle-SymbolicName: org.scala-lang.scala-compiler
 ver: 2.10.0
 Bundle-Version: ${ver}
 Export-Package: *;version=${ver}
-Import-Package: scala.tools.jline;optional=true, *
+Import-Package: scala.tools.jline;resolution:=optional, *

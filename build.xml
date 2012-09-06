@@ -284,6 +284,14 @@ INITIALISATION
     <artifact:dependencies pathId="extra.tasks.classpath" filesetId="extra.tasks.fileset">
       <dependency groupId="biz.aQute" artifactId="bnd" version="0.0.384"/>
     </artifact:dependencies>
+    <!-- Pax runner -->
+    <property name="pax.exam.version" value="2.5.0"/>
+    <artifact:dependencies pathId="pax.exam.classpath" filesetId="pax.exam.fileset">
+      <dependency groupId="org.ops4j.pax.exam" artifactId="pax-exam-container-native" version="${pax.exam.version}"/>
+      <dependency groupId="org.ops4j.pax.exam" artifactId="pax-exam-junit4" version="${pax.exam.version}"/>
+      <dependency groupId="junit" artifactId="junit" version="4.10"/>
+      <dependency groupId="org.apache.felix" artifactId="org.apache.felix.framework" version="3.2.2"/>
+    </artifact:dependencies>
     <!-- BND support -->
     <typedef resource="aQute/bnd/ant/taskdef.properties" classpathref="extra.tasks.classpath" />
     <property name="init.maven.tasks.finished" value="true" />
@@ -1689,6 +1697,9 @@ OSGi Artifacts
   <target name="osgi.init" depends="pack.done">
     <mkdir dir="${build-osgi.dir}"/>
 
+    <property name="osgi.test.src" value="${partest.dir}/osgi/src"/>
+    <property name="osgi.test.classes" value="${build-osgi.dir}/classes"/>
+
     <!-- simplify fixing pom versions -->
     <macrodef name="make-bundle">
       <attribute name="name" />
@@ -1723,6 +1734,27 @@ OSGi Artifacts
   </target>
 
   <target name="osgi.done" depends="osgi.bundles, osgi.bundles.swing"/>
+
+
+
+  <target name="osgi.test.comp" depends="osgi.done, quick.done">
+    <stopwatch name="osgi.test.comp.timer"/>
+    <mkdir dir="${osgi.test.classes}"/>
+    <scalacfork
+      destdir="${osgi.test.classes}"
+      compilerpathref="quick.classpath"
+      params="${scalac.args.quick}"
+      srcdir="${osgi.test.src}"
+      jvmargs="${scalacfork.jvmargs}">
+      <include name="**/*.scala"/>
+      <compilationpath>
+        <pathelement location="${build-quick.dir}/classes/library"/>
+        <path refid="pax.exam.classpath"/>
+        <path refid="forkjoin.classpath"/>
+      </compilationpath>
+    </scalacfork>
+    <stopwatch name="osgi.test.comp.timer" action="total"/>   
+  </target>
 
   <target name="osgi.clean">
     <delete dir="${build-osgi.dir}" includeemptydirs="yes" quiet="yes" failonerror="no"/>

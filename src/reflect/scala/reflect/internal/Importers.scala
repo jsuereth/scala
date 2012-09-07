@@ -2,10 +2,9 @@ package scala.reflect
 package internal
 import scala.collection.mutable.WeakHashMap
 
-// todo: move importers to a mirror
-trait Importers { self: SymbolTable =>
+// SI-6241: move importers to a mirror
+trait Importers extends api.Importers { self: SymbolTable =>
 
-  // [Eugene] possible to make this less cast-heavy?
   def mkImporter(from0: api.Universe): Importer { val from: from0.type } = (
     if (self eq from0) {
       new Importer {
@@ -14,6 +13,7 @@ trait Importers { self: SymbolTable =>
         def importSymbol(sym: from.Symbol) = sym.asInstanceOf[self.Symbol]
         def importType(tpe: from.Type) = tpe.asInstanceOf[self.Type]
         def importTree(tree: from.Tree) = tree.asInstanceOf[self.Tree]
+        def importPosition(pos: from.Position) = pos.asInstanceOf[self.Position]
       }
     } else {
       // todo. fix this loophole
@@ -238,7 +238,7 @@ trait Importers { self: SymbolTable =>
         case from.AntiPolyType(pre, targs) =>
           AntiPolyType(importType(pre), targs map importType)
         case x: from.TypeVar =>
-          TypeVar(importType(x.origin), importTypeConstraint(x.constr0), x.typeArgs map importType, x.params map importSymbol)
+          TypeVar(importType(x.origin), importTypeConstraint(x.constr), x.typeArgs map importType, x.params map importSymbol)
         case from.NotNullType(tpe) =>
           NotNullType(importType(tpe))
         case from.AnnotatedType(annots, tpe, selfsym) =>

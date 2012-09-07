@@ -62,6 +62,7 @@ import java.io._
  *  section on `Lists` for more information.
  *
  *  @define coll list
+ *  @define Coll `List`
  *  @define thatinfo the class of the returned collection. In the standard library configuration,
  *    `That` is always `List[B]` because an implicit of type `CanBuildFrom[List, B, That]`
  *    is defined in object `List`.
@@ -96,7 +97,7 @@ sealed abstract class List[+A] extends AbstractSeq[A]
    *
    *  @usecase def ::(x: A): List[A]
    *    @inheritdoc
-   *    
+   *
    *    Example:
    *    {{{1 :: List(2, 3) = List(2, 3).::(1) = List(1, 2, 3)}}}
    */
@@ -301,6 +302,15 @@ sealed abstract class List[+A] extends AbstractSeq[A]
     if (isEmpty) Stream.Empty
     else new Stream.Cons(head, tail.toStream)
 
+  @inline override final
+  def foreach[B](f: A => B) {
+    var these = this
+    while (!these.isEmpty) {
+      f(these.head)
+      these = these.tail
+    }
+  }
+
   @deprecated("use `distinct` instead", "2.8.0")
   def removeDuplicates: List[A] = distinct
 }
@@ -377,7 +387,6 @@ final case class ::[B](private var hd: B, private[scala] var tl: List[B]) extend
     while (!xs.isEmpty) { out.writeObject(xs.head); xs = xs.tail }
     out.writeObject(ListSerializeEnd)
   }
-
 }
 
 /** $factoryInfo

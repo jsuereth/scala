@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -50,7 +50,7 @@ trait Trees extends reflect.internal.Trees { self: Global =>
 
  /** Array selection <qualifier> . <name> only used during erasure */
   case class SelectFromArray(qualifier: Tree, name: Name, erasure: Type)
-       extends TermTree with RefTree
+       extends RefTree with TermTree
 
   /** Derived value class injection (equivalent to: new C(arg) after easure); only used during erasure
    *  The class C is stored as the symbol of the tree node.
@@ -95,11 +95,12 @@ trait Trees extends reflect.internal.Trees { self: Global =>
     val (edefs, rest) = body span treeInfo.isEarlyDef
     val (evdefs, etdefs) = edefs partition treeInfo.isEarlyValDef
     val gvdefs = evdefs map {
-      case vdef @ ValDef(_, _, tpt, _) => copyValDef(vdef)(
-        // !!! I know "atPos in case" wasn't intentionally planted to
-        // add an air of mystery to this file, but it is the sort of
-        // comment which only its author could love.
-        tpt = atPos(vdef.pos.focus)(TypeTree() setOriginal tpt setPos tpt.pos.focus), // atPos in case
+      case vdef @ ValDef(_, _, tpt, _) =>
+        copyValDef(vdef)(
+        // atPos for the new tpt is necessary, since the original tpt might have no position
+        // (when missing type annotation for ValDef for example), so even though setOriginal modifies the
+        // position of TypeTree, it would still be NoPosition. That's what the author meant.
+        tpt = atPos(vdef.pos.focus)(TypeTree() setOriginal tpt setPos tpt.pos.focus),
         rhs = EmptyTree
       )
     }
@@ -110,22 +111,19 @@ trait Trees extends reflect.internal.Trees { self: Global =>
         if (body forall treeInfo.isInterfaceMember) List()
         else List(
           atPos(wrappingPos(superPos, lvdefs)) (
-            DefDef(NoMods, nme.MIXIN_CONSTRUCTOR, List(), List(List()), TypeTree(), Block(lvdefs, Literal(Constant())))))
+            DefDef(NoMods, nme.MIXIN_CONSTRUCTOR, List(), ListOfNil, TypeTree(), Block(lvdefs, Literal(Constant())))))
       } else {
         // convert (implicit ... ) to ()(implicit ... ) if its the only parameter section
         if (vparamss1.isEmpty || !vparamss1.head.isEmpty && vparamss1.head.head.mods.isImplicit)
           vparamss1 = List() :: vparamss1;
         val superRef: Tree = atPos(superPos)(gen.mkSuperSelect)
-        def mkApply(fun: Tree, args: List[Tree]) = Apply(fun, args)
-        val superCall = (superRef /: argss) (mkApply)
-        // [Eugene++] no longer compiles after I moved the `Apply` case class into scala.reflect.internal
-        // val superCall = (superRef /: argss) (Apply)
+        val superCall = (superRef /: argss) (Apply.apply)
         List(
           atPos(wrappingPos(superPos, lvdefs ::: argss.flatten)) (
             DefDef(constrMods, nme.CONSTRUCTOR, List(), vparamss1, TypeTree(), Block(lvdefs ::: List(superCall), Literal(Constant())))))
       }
     }
-    constrs foreach (ensureNonOverlapping(_, parents ::: gvdefs))
+    constrs foreach (ensureNonOverlapping(_, parents ::: gvdefs, focus=false))
     // Field definitions for the class - remove defaults.
     val fieldDefs = vparamss.flatten map (vd => copyValDef(vd)(mods = vd.mods &~ DEFAULTPARAM, rhs = EmptyTree))
 

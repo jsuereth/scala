@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -44,7 +44,7 @@ abstract class TreeGen extends reflect.internal.TreeGen with TreeDSL {
           setInfo analyzer.ImportType(qual)
     )
     val importTree = (
-      Import(qual, List(ImportSelector(nme.WILDCARD, -1, null, -1)))
+      Import(qual, ImportSelector.wildList)
         setSymbol importSym
           setType NoType
     )
@@ -58,7 +58,7 @@ abstract class TreeGen extends reflect.internal.TreeGen with TreeDSL {
   def mkUnchecked(expr: Tree): Tree = atPos(expr.pos) {
     // This can't be "Annotated(New(UncheckedClass), expr)" because annotations
     // are very picky about things and it crashes the compiler with "unexpected new".
-    Annotated(New(scalaDot(UncheckedClass.name), List(Nil)), expr)
+    Annotated(New(scalaDot(UncheckedClass.name), ListOfNil), expr)
   }
   // if it's a Match, mark the selector unchecked; otherwise nothing.
   def mkUncheckedMatch(tree: Tree) = tree match {
@@ -71,8 +71,6 @@ abstract class TreeGen extends reflect.internal.TreeGen with TreeDSL {
     // are very picky about things and it crashes the compiler with "unexpected new".
     Annotated(Ident(nme.synthSwitch), expr)
   }
-
-  def hasSynthCaseSymbol(t: Tree) = (t.symbol ne null) && (t.symbol hasFlag (CASE | SYNTHETIC))
 
   // TODO: would be so much nicer if we would know during match-translation (i.e., type checking)
   // whether we should emit missingCase-style apply (and isDefinedAt), instead of transforming trees post-factum
@@ -94,13 +92,13 @@ abstract class TreeGen extends reflect.internal.TreeGen with TreeDSL {
       case Apply(Apply(TypeApply(Select(tgt, nme.runOrElse), targs), List(scrut)), List(matcher)) if opt.virtPatmat => // println("virt match: "+ (tgt, targs, scrut, matcher) + "for:\n"+ matchExpr )
         caseVirtualizedMatch(matchExpr, tgt, targs, scrut, matcher)
       // optimized version of virtpatmat
-      case Block(stats, matchEndDef) if opt.virtPatmat && (stats forall hasSynthCaseSymbol) =>
+      case Block(stats, matchEndDef) if opt.virtPatmat && (stats forall treeInfo.hasSynthCaseSymbol) =>
         // the assumption is once we encounter a case, the remainder of the block will consist of cases
         // the prologue may be empty, usually it is the valdef that stores the scrut
         val (prologue, cases) = stats span (s => !s.isInstanceOf[LabelDef])
         caseVirtualizedMatchOpt(matchExpr, prologue, cases, matchEndDef, identity)
       // optimized version of virtpatmat
-      case Block(outerStats, orig@Block(stats, matchEndDef)) if opt.virtPatmat && (stats forall hasSynthCaseSymbol) =>
+      case Block(outerStats, orig@Block(stats, matchEndDef)) if opt.virtPatmat && (stats forall treeInfo.hasSynthCaseSymbol) =>
         val (prologue, cases) = stats span (s => !s.isInstanceOf[LabelDef])
         caseVirtualizedMatchOpt(matchExpr, prologue, cases, matchEndDef, m => copyBlock(matchExpr, outerStats, m))
       case other =>
@@ -359,8 +357,8 @@ abstract class TreeGen extends reflect.internal.TreeGen with TreeDSL {
    */
   def mkSynchronizedCheck(clazz: Symbol, cond: Tree, syncBody: List[Tree], stats: List[Tree]): Tree =
     mkSynchronizedCheck(mkAttributedThis(clazz), cond, syncBody, stats)
-    
-  def mkSynchronizedCheck(attrThis: Tree, cond: Tree, syncBody: List[Tree], stats: List[Tree]): Tree = 
+
+  def mkSynchronizedCheck(attrThis: Tree, cond: Tree, syncBody: List[Tree], stats: List[Tree]): Tree =
     Block(mkSynchronized(
       attrThis,
       If(cond, Block(syncBody: _*), EmptyTree)) ::

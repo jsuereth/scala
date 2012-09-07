@@ -61,10 +61,8 @@ trait SymbolLoaders { self: SymbolTable =>
     assert(!(name.toString endsWith "[]"), name)
     val clazz = owner.newClass(name)
     val module = owner.newModule(name.toTermName)
-    // [Eugene++] am I doing this right?
-    // todo: drop condition, see what goes wrong
-    // [Eugene++ to Martin] test/files/run/t5256g and test/files/run/t5256h will crash
-    // reflection meeting verdict: need to enter the symbols into the first symbol in the owner chain that has a non-empty scope
+    // without this check test/files/run/t5256g and test/files/run/t5256h will crash
+    // todo. reflection meeting verdict: need to enter the symbols into the first symbol in the owner chain that has a non-empty scope
     if (owner.info.decls != EmptyScope) {
       owner.info.decls enter clazz
       owner.info.decls enter module
@@ -99,8 +97,10 @@ trait SymbolLoaders { self: SymbolTable =>
     0 < dp && dp < (name.length - 1)
   }
 
-  class PackageScope(pkgClass: Symbol) extends Scope() with SynchronizedScope {
+  class PackageScope(pkgClass: Symbol) extends Scope(initFingerPrints = -1L) // disable fingerprinting as we do not know entries beforehand
+      with SynchronizedScope {
     assert(pkgClass.isType)
+    // disable fingerprinting as we do not know entries beforehand
     private val negatives = mutable.Set[Name]() // Syncnote: Performance only, so need not be protected.
     override def lookupEntry(name: Name): ScopeEntry = {
       val e = super.lookupEntry(name)

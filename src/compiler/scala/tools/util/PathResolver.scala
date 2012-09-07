@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2006-2011 LAMP/EPFL
+ * Copyright 2006-2012 LAMP/EPFL
  * @author  Paul Phillips
  */
 
@@ -194,7 +194,7 @@ class PathResolver(settings: Settings, context: JavaContext) {
     def scalaBootClassPath  = cmdLineOrElse("bootclasspath", Defaults.scalaBootClassPath)
     def scalaExtDirs        = cmdLineOrElse("extdirs", Defaults.scalaExtDirs)
     /** Scaladoc doesn't need any bootstrapping, otherwise will create errors such as:
-     * [scaladoc] ../scala-trunk/src/reflect/scala/reflect/makro/Reifiers.scala:89: error: object api is not a member of package reflect
+     * [scaladoc] ../scala-trunk/src/reflect/scala/reflect/macros/Reifiers.scala:89: error: object api is not a member of package reflect
      * [scaladoc] case class ReificationError(val pos: reflect.api.PositionApi, val msg: String) extends Throwable(msg)
      * [scaladoc]                                              ^
      * because the bootstrapping will look at the sourcepath and create package "reflect" in "<root>"

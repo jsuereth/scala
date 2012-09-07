@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -43,8 +43,6 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
     with DocComments
     with Positions { self =>
 
-  // [Eugene++] would love to find better homes for the new things dumped into Global
-
   // the mirror --------------------------------------------------
 
   override def isCompilerUniverse = true
@@ -62,26 +60,19 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
   }
   def RootClass: ClassSymbol = rootMirror.RootClass
   def EmptyPackageClass: ClassSymbol = rootMirror.EmptyPackageClass
-  // [Eugene++] this little inconvenience gives us precise types for Expr.mirror and TypeTag.mirror
-  // by the way, is it possible to define variant type members?
-
-  override def settings = currentSettings
 
   import definitions.findNamedMember
   def findMemberFromRoot(fullName: Name): Symbol = rootMirror.findMemberFromRoot(fullName)
 
   // alternate constructors ------------------------------------------
 
+  override def settings = currentSettings
+
   def this(reporter: Reporter) =
     this(new Settings(err => reporter.error(null, err)), reporter)
 
   def this(settings: Settings) =
     this(settings, new ConsoleReporter(settings))
-
-  // fulfilling requirements
-  // Renamed AbstractFile to AbstractFileType for backward compatibility:
-  // it is difficult for sbt to work around the ambiguity errors which result.
-  type AbstractFileType = scala.tools.nsc.io.AbstractFile
 
   def mkAttributedQualifier(tpe: Type, termSym: Symbol): Tree = gen.mkAttributedQualifier(tpe, termSym)
 
@@ -220,11 +211,11 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
 
   // not deprecated yet, but a method called "error" imported into
   // nearly every trait really must go.  For now using globalError.
-  def error(msg: String)       = globalError(msg)
-  def globalError(msg: String) = reporter.error(NoPosition, msg)
-  def inform(msg: String)      = reporter.echo(msg)
-  def warning(msg: String)     =
-    if (opt.fatalWarnings) globalError(msg)
+  def error(msg: String)                = globalError(msg)
+  def inform(msg: String)               = reporter.echo(msg)
+  override def globalError(msg: String) = reporter.error(NoPosition, msg)
+  override def warning(msg: String)     =
+    if (settings.fatalWarnings.value) globalError(msg)
     else reporter.warning(NoPosition, msg)
 
   // Getting in front of Predef's asserts to supplement with more info.
@@ -873,8 +864,6 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
   /** Is given package class a system package class that cannot be invalidated?
    */
   private def isSystemPackageClass(pkg: Symbol) =
-    // [Eugene++ to Martin] please, verify
-// was:    pkg == definitions.RootClass ||
     pkg == RootClass ||
     pkg == definitions.ScalaPackageClass || {
       val pkgname = pkg.fullName
@@ -937,8 +926,6 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
             else new MergedClassPath(elems, classPath.context)
           val oldEntries = mkClassPath(subst.keys)
           val newEntries = mkClassPath(subst.values)
-          // [Eugene++ to Martin] please, verify
-// was:          reSync(definitions.RootClass, Some(classPath), Some(oldEntries), Some(newEntries), invalidated, failed)
           reSync(RootClass, Some(classPath), Some(oldEntries), Some(newEntries), invalidated, failed)
         }
     }
@@ -998,8 +985,6 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
       invalidateOrRemove(root)
     } else {
       if (classesFound) {
-        // [Eugene++ to Martin] please, verify
-// was:        if (root.isRoot) invalidateOrRemove(definitions.EmptyPackageClass)
         if (root.isRoot) invalidateOrRemove(EmptyPackageClass)
         else failed += root
       }
@@ -1230,8 +1215,8 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
 
     var reportedFeature = Set[Symbol]()
 
-    /** A flag whether macro expansions failed */
-    var macroExpansionFailed = false
+    /** Has any macro expansion used a fallback during this run? */
+    var seenMacroExpansionsFallingBack = false
 
     /** To be initialized from firstPhase. */
     private var terminalPhase: Phase = NoPhase
@@ -1447,6 +1432,8 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
       settings.userSetSettings filter (_.isDeprecated) foreach { s =>
         unit.deprecationWarning(NoPosition, s.name + " is deprecated: " + s.deprecationMessage.get)
       }
+      if (settings.target.value.contains("jvm-1.5"))
+        unit.deprecationWarning(NoPosition, settings.target.name + ":" + settings.target.value + " is deprecated: use target for Java 1.6 or above.")
     }
 
     /* An iterator returning all the units being compiled in this run */
@@ -1519,7 +1506,7 @@ class Global(var currentSettings: Settings, var reporter: Reporter)
       else {
         allConditionalWarnings foreach (_.summarize)
 
-        if (macroExpansionFailed)
+        if (seenMacroExpansionsFallingBack)
           warning("some macros could not be expanded and code fell back to overridden methods;"+
                   "\nrecompiling with generated classfiles on the classpath might help.")
         // todo: migrationWarnings

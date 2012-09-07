@@ -217,13 +217,16 @@ PROPERTIES
   <property name="build-palo.dir" value="${build.dir}/palo"/>
   <property name="build-quick.dir" value="${build.dir}/quick"/>
   <property name="build-pack.dir" value="${build.dir}/pack"/>
+  <property name="build-osgi.dir" value="${build.dir}/osgi"/>
   <property name="build-strap.dir" value="${build.dir}/strap"/>
   <property name="build-docs.dir" value="${build.dir}/scaladoc"/>
   <property name="build-libs.dir" value="${build.dir}/libs"/>
+  <property name="build-sbt.dir" value="${build.dir}/sbt-interface"/>
+
 
   <property name="dists.dir" value="${basedir}/dists"/>
 
-  <property name="copyright.string" value="Copyright 2002-2011, LAMP/EPFL"/>
+  <property name="copyright.string" value="Copyright 2002-2012, LAMP/EPFL"/>
   <property name="partest.version.number" value="0.9.2"/>
 
   <!-- These are NOT the flags used to run SuperSabbus, but the ones written
@@ -277,10 +280,30 @@ INITIALISATION
     <property name="init.maven.tasks.finished" value="true" />
   </target>
 
+  <target name="init.extra.tasks" depends="init.maven.tasks" unless="init.extra.tasks.finished">
+    <artifact:dependencies pathId="extra.tasks.classpath" filesetId="extra.tasks.fileset">
+      <dependency groupId="biz.aQute" artifactId="bnd" version="0.0.384"/>
+    </artifact:dependencies>
+    <!-- Pax runner -->
+    <property name="pax.exam.version" value="2.5.0"/>
+    <artifact:dependencies pathId="pax.exam.classpath" filesetId="pax.exam.fileset">
+      <dependency groupId="org.ops4j.pax.exam" artifactId="pax-exam-container-native" version="${pax.exam.version}"/>
+      <dependency groupId="org.ops4j.pax.exam" artifactId="pax-exam-junit4" version="${pax.exam.version}"/>
+      <dependency groupId="org.ops4j.pax.swissbox" artifactId="pax-swissbox-framework" version="1.5.1"/>
+      <dependency groupId="junit" artifactId="junit" version="4.10"/>
+      <dependency groupId="org.apache.felix" artifactId="org.apache.felix.framework" version="3.2.2"/>
+    </artifact:dependencies>
+    <!-- BND support -->
+    <typedef resource="aQute/bnd/ant/taskdef.properties" classpathref="extra.tasks.classpath" />
+    <property name="init.maven.tasks.finished" value="true" />
+  </target>
+
   <!-- Resolve maven dependencies -->
   <target name="init.maven.jars" depends="init.maven.tasks">
+    <!-- This target has an issue where if the user directory does not exist, we BOMB. ugh. -->
+    <mkdir dir="${user.home}/.m2/repository"/>
     <artifact:dependencies pathId="dependency.classpath" filesetId="dependency.fileset">
-      <dependency groupId="com.typesafe" artifactId="config" version="0.4.0"/>
+      <!--<dependency groupId="com.typesafe" artifactId="config" version="0.4.0"/>-->
     </artifact:dependencies>
   </target>
 
@@ -396,8 +419,8 @@ INITIALISATION
      </echo>
   </target>
 
-  <target name="init" depends="init.jars, init.maven.jars, init.version.done, init.fail.bad.jdk, init.warn.jdk7">
-    <property name="scalac.args.always" value="" />
+  <target name="init" depends="init.jars, init.maven.jars, init.version.done, init.fail.bad.jdk, init.warn.jdk7, init.extra.tasks">
+    <property name="scalac.args.always" value="-Yreify-copypaste" />
   <!-- scalac.args.optimise is selectively overridden in certain antcall tasks. -->
     <property name="scalac.args.optimise" value=""/>
   <!-- scalac.args.quickonly are added to quick.* targets but not others (particularly, locker.)
@@ -499,7 +522,7 @@ LOCAL DEPENDENCY (Adapted ASM)
       destdir="${build-asm.dir}/classes"
       classpath="${build-asm.dir}/classes"
       includes="**/*.java"
-      target="1.5" source="1.5">
+      target="1.6" source="1.5">
         <compilerarg line="${javac.args} -XDignore.symbol.file"/>
     </javac>
     <touch file="${build-asm.dir}/asm.complete" verbose="no"/>
@@ -540,7 +563,7 @@ LOCAL DEPENDENCY (FORKJOIN)
       classpath="${build-libs.dir}/classes/forkjoin"
       includes="**/*.java"
       debug="true"
-      target="1.5" source="1.5">
+      target="1.6" source="1.5">
         <compilerarg line="${javac.args} -XDignore.symbol.file"/>
     </javac>
     <touch file="${build-libs.dir}/forkjoin.complete" verbose="no"/>
@@ -587,7 +610,7 @@ LOCAL DEPENDENCY (FJBG)
       classpath="${build-libs.dir}/classes/fjbg"
       includes="**/*.java"
       debug="true"
-      target="1.5" source="1.4">
+      target="1.6" source="1.4">
         <compilerarg line="${javac.args} -XDignore.symbol.file"/>
     </javac>
     <touch file="${build-libs.dir}/fjbg.complete" verbose="no"/>
@@ -635,7 +658,7 @@ LOCAL REFERENCE BUILD (LOCKER)
       srcdir="${src.dir}/library"
       destdir="${build-locker.dir}/classes/library"
       includes="**/*.java"
-      target="1.5" source="1.5">
+      target="1.6" source="1.5">
         <compilerarg line="${javac.args} -XDignore.symbol.file"/>
         <classpath>
           <path refid="forkjoin.classpath"/>
@@ -749,7 +772,7 @@ LOCAL REFERENCE BUILD (LOCKER)
           includes="**/*.java"
           excludes="**/tests/**"
           debug="true"
-          target="1.5" source="1.4">
+          target="1.6" source="1.4">
             <compilerarg line="${javac.args}"/>
         </javac>
         <scalacfork
@@ -1009,7 +1032,7 @@ QUICK BUILD (QUICK)
       srcdir="${src.dir}/library"
       destdir="${build-quick.dir}/classes/library"
       includes="**/*.java"
-      target="1.5" source="1.5">
+      target="1.6" source="1.5">
       <compilerarg line="${javac.args} -XDignore.symbol.file"/>
       <classpath>
         <path refid="forkjoin.classpath"/>
@@ -1020,7 +1043,7 @@ QUICK BUILD (QUICK)
       srcdir="${src.dir}/actors"
       destdir="${build-quick.dir}/classes/library"
       includes="**/*.java"
-      target="1.5" source="1.5">
+      target="1.6" source="1.5">
       <compilerarg line="${javac.args}"/>
       <classpath>
         <path refid="forkjoin.classpath"/>
@@ -1145,7 +1168,7 @@ QUICK BUILD (QUICK)
       includes="**/*.java"
       excludes="**/tests/**"
       debug="true"
-      target="1.5" source="1.4">
+      target="1.6" source="1.4">
         <compilerarg line="${javac.args}"/>
     </javac>
     <scalacfork
@@ -1294,7 +1317,7 @@ QUICK BUILD (QUICK)
     <scalacfork
       destdir="${build-quick.dir}/classes/scalacheck"
       compilerpathref="quick.classpath"
-      params="${scalac.args.quick}"
+      params="${scalac.args.quick} -nowarn"
       srcdir="${src.dir}/scalacheck"
       jvmargs="${scalacfork.jvmargs}">
       <include name="**/*.scala"/>
@@ -1337,7 +1360,7 @@ QUICK BUILD (QUICK)
     <stopwatch name="quick.scalap.timer" action="total"/>
   </target>
 
-  <target name="quick.pre-partest" depends="quick.scalap">
+  <target name="quick.pre-partest" depends="quick.scalap, asm.done">
     <uptodate property="quick.partest.available" targetfile="${build-quick.dir}/partest.complete">
       <srcfiles dir="${src.dir}/partest"/>
     </uptodate>
@@ -1349,13 +1372,14 @@ QUICK BUILD (QUICK)
     <javac
       srcdir="${src.dir}/partest"
       destdir="${build-quick.dir}/classes/partest"
-      target="1.5" source="1.5">
+      target="1.6" source="1.5">
       <classpath>
         <pathelement location="${build-quick.dir}/classes/library"/>
         <pathelement location="${build-quick.dir}/classes/reflect"/>
         <pathelement location="${build-quick.dir}/classes/compiler"/>
         <pathelement location="${build-quick.dir}/classes/scalap"/>
         <pathelement location="${build-quick.dir}/classes/partest"/>
+        <path refid="asm.classpath"/>
       </classpath>
       <include name="**/*.java"/>
       <compilerarg line="${javac.args}"/>
@@ -1575,7 +1599,14 @@ PACKED QUICK BUILD (PACK)
   <target name="pack.partest" depends="pack.pre-partest" unless="pack.partest.available">
     <mkdir dir="${build-pack.dir}/lib"/>
     <jar destfile="${build-pack.dir}/lib/scala-partest.jar">
-      <fileset dir="${build-quick.dir}/classes/partest"/>
+      <fileset dir="${build-quick.dir}/classes/partest">
+        <exclude name="scala/tools/partest/javaagent/**"/>
+      </fileset>
+    </jar>
+    <jar destfile="${build-pack.dir}/lib/scala-partest-javaagent.jar" manifest="${src.dir}/partest/scala/tools/partest/javaagent/MANIFEST.MF">
+      <fileset dir="${build-quick.dir}/classes/partest">
+        <include name="scala/tools/partest/javaagent/**"/>
+      </fileset>
     </jar>
   </target>
 
@@ -1661,6 +1692,76 @@ PACKED QUICK BUILD (PACK)
   </target>
 
 <!-- ===========================================================================
+OSGi Artifacts
+============================================================================ -->
+
+  <target name="osgi.init" depends="pack.done">
+    <mkdir dir="${build-osgi.dir}"/>
+
+    <property name="osgi.test.src" value="${partest.dir}/osgi/src"/>
+    <property name="osgi.test.classes" value="${build-osgi.dir}/classes"/>
+
+    <!-- simplify fixing pom versions -->
+    <macrodef name="make-bundle">
+      <attribute name="name" />
+      <attribute name="version" />
+      <sequential>
+        <copy file="${src.dir}/build/bnd/@{name}.bnd" tofile="${build-osgi.dir}/@{name}.bnd" overwrite="true">
+          <filterset>
+            <filter token="VERSION" value="@{version}" />
+          </filterset>
+        </copy>
+        <bnd classpath="${build-pack.dir}/lib/@{name}.jar"
+             eclipse="false"
+             failok="false"
+             exceptions="true"
+             files="${build-osgi.dir}/@{name}.bnd"
+             output="${build-osgi.dir}"/>
+      </sequential>
+    </macrodef>
+  </target>
+
+  <target name="osgi.bundles" depends="osgi.init">
+    <make-bundle name="scala-library" version="${osgi.version.number}" />
+    <make-bundle name="scala-actors" version="${osgi.version.number}" />
+    <make-bundle name="scala-actors-migration" version="${osgi.version.number}" />
+    <make-bundle name="scala-reflect" version="${osgi.version.number}" />
+    <make-bundle name="scala-compiler" version="${osgi.version.number}" />
+  </target>
+
+  <target name="osgi.bundles.swing" depends="osgi.init" if="has.java6">
+    <!-- TODO - only if JDK6 -->
+    <make-bundle name="scala-swing" version="${osgi.version.number}"/>
+  </target>
+
+  <target name="osgi.done" depends="osgi.bundles, osgi.bundles.swing"/>
+
+
+
+  <target name="osgi.test.comp" depends="osgi.done, quick.done">
+    <stopwatch name="osgi.test.comp.timer"/>
+    <mkdir dir="${osgi.test.classes}"/>
+    <scalacfork
+      destdir="${osgi.test.classes}"
+      compilerpathref="quick.classpath"
+      params="${scalac.args.quick}"
+      srcdir="${osgi.test.src}"
+      jvmargs="${scalacfork.jvmargs}">
+      <include name="**/*.scala"/>
+      <compilationpath>
+        <pathelement location="${build-quick.dir}/classes/library"/>
+        <path refid="pax.exam.classpath"/>
+        <path refid="forkjoin.classpath"/>
+      </compilationpath>
+    </scalacfork>
+    <stopwatch name="osgi.test.comp.timer" action="total"/>   
+  </target>
+
+  <target name="osgi.clean">
+    <delete dir="${build-osgi.dir}" includeemptydirs="yes" quiet="yes" failonerror="no"/>
+  </target>
+
+<!-- ===========================================================================
 BOOTSTRAPPING BUILD (STRAP)
 ============================================================================ -->
 
@@ -1683,7 +1784,7 @@ BOOTSTRAPPING BUILD (STRAP)
       srcdir="${src.dir}/library"
       destdir="${build-strap.dir}/classes/library"
       includes="**/*.java"
-      target="1.5" source="1.5">
+      target="1.6" source="1.5">
       <compilerarg line="${javac.args} -XDignore.symbol.file"/>
       <classpath>
         <path refid="forkjoin.classpath"/>
@@ -1694,7 +1795,7 @@ BOOTSTRAPPING BUILD (STRAP)
       srcdir="${src.dir}/actors"
       destdir="${build-strap.dir}/classes/library"
       includes="**/*.java"
-      target="1.5" source="1.5">
+      target="1.6" source="1.5">
       <compilerarg line="${javac.args}"/>
       <classpath>
         <path refid="forkjoin.classpath"/>
@@ -1818,7 +1919,7 @@ BOOTSTRAPPING BUILD (STRAP)
       includes="**/*.java"
       excludes="**/tests/**"
       debug="true"
-      target="1.5" source="1.4">
+      target="1.6" source="1.4">
         <compilerarg line="${javac.args}"/>
     </javac>
     <scalacfork
@@ -1934,7 +2035,7 @@ BOOTSTRAPPING BUILD (STRAP)
     <scalacfork
       destdir="${build-strap.dir}/classes/scalacheck"
       compilerpathref="pack.classpath"
-      params="${scalac.args.quick}"
+      params="${scalac.args.quick} -nowarn"
       srcdir="${src.dir}/scalacheck"
       jvmargs="${scalacfork.jvmargs}">
       <include name="**/*.scala"/>
@@ -1974,7 +2075,7 @@ BOOTSTRAPPING BUILD (STRAP)
     <stopwatch name="strap.scalap.timer" action="total"/>
   </target>
 
-  <target name="strap.pre-partest" depends="strap.scalap">
+  <target name="strap.pre-partest" depends="strap.scalap, asm.done">
     <uptodate property="strap.partest.available" targetfile="${build-strap.dir}/partest.complete">
       <srcfiles dir="${src.dir}/partest"/>
     </uptodate>
@@ -1986,13 +2087,14 @@ BOOTSTRAPPING BUILD (STRAP)
     <javac
       srcdir="${src.dir}/partest"
       destdir="${build-strap.dir}/classes/partest"
-      target="1.5" source="1.5">
+      target="1.6" source="1.5">
       <classpath>
         <pathelement location="${build-strap.dir}/classes/library"/>
         <pathelement location="${build-strap.dir}/classes/reflect"/>
         <pathelement location="${build-strap.dir}/classes/compiler"/>
         <pathelement location="${build-strap.dir}/classes/scalap"/>
         <pathelement location="${build-strap.dir}/classes/partest"/>
+        <path refid="asm.classpath"/>
       </classpath>
       <include name="**/*.java"/>
       <compilerarg line="${javac.args}"/>
@@ -2012,6 +2114,7 @@ BOOTSTRAPPING BUILD (STRAP)
         <pathelement location="${build-strap.dir}/classes/partest"/>
         <pathelement location="${ant.jar}"/>
         <path refid="forkjoin.classpath"/>
+        <path refid="asm.classpath"/>
         <pathelement location="${scalacheck.jar}"/>
       </compilationpath>
     </scalacfork>
@@ -2034,9 +2137,77 @@ BOOTSTRAPPING BUILD (STRAP)
 LIBRARIES (Forkjoin, FJBG, ASM)
 ============================================================================ -->
 
- 
+
   <target name="libs.clean" depends="pack.clean, asm.clean">
     <delete dir="${build-libs.dir}" includeemptydirs="yes" quiet="yes" failonerror="no"/>
+  </target>
+
+<!-- ===========================================================================
+SBT Compiler Interface
+============================================================================ -->
+
+  <target name="sbt.start" depends="init">
+    <!-- TODO - Put this in init?   Allow this to be overriden simply -->
+    <property name="sbt.latest.version" value="0.12.0"/>
+
+
+    <property name="sbt.src.dir" value="${build-sbt.dir}/${sbt.latest.version}/src"/>
+    <property name="sbt.lib.dir" value="${build-sbt.dir}/${sbt.latest.version}/lib"/>
+
+
+
+    <property name="sbt.interface.jar" value="${sbt.lib.dir}/interface.jar"/>
+    <property name="sbt.interface.url" value="http://typesafe.artifactoryonline.com/typesafe/ivy-releases/org.scala-sbt/interface/${sbt.latest.version}/jars/interface.jar"/>
+    <property name="sbt.interface.src.jar" value="${sbt.src.dir}/compiler-interface-src.jar"/>
+    <property name="sbt.interface.src.url" value="http://typesafe.artifactoryonline.com/typesafe/ivy-releases/org.scala-sbt/compiler-interface/${sbt.latest.version}/jars/compiler-interface-src.jar"/>
+
+    <!-- Ensure directories exist -->
+    <mkdir dir="${sbt.src.dir}"/>
+    <mkdir dir="${sbt.lib.dir}"/>
+
+    <condition property="sbt.available">
+      <and>
+        <available file="${sbt.interface.jar}"/>
+        <available file="${sbt.interface.src.jar}"/>
+      </and>
+    </condition>
+
+  </target>
+
+  <target name="sbt.libs" depends="sbt.start" unless="sbt.available">
+    <get src="${sbt.interface.url}" dest="${sbt.interface.jar}"/>
+    <get src="${sbt.interface.src.url}" dest="${sbt.interface.src.jar}"/>
+    <!-- Explode sources -->
+    <unzip src="${sbt.interface.src.jar}" dest="${sbt.src.dir}"/>
+  </target>
+
+  <target name="sbt.compile" depends="sbt.libs,quick.done">
+    <stopwatch name="quick.sbt-interface.timer"/>
+    <mkdir dir="${build-sbt.dir}/classes"/>
+    <scalacfork
+      destdir="${build-sbt.dir}/classes"
+      compilerpathref="quick.classpath"
+      params="${scalac.args.quick}"
+      srcdir="${sbt.src.dir}"
+      jvmargs="${scalacfork.jvmargs}">
+      <include name="**/*.scala"/>
+      <compilationpath>
+        <pathelement location="${build-quick.dir}/classes/library"/>
+        <pathelement location="${build-quick.dir}/classes/reflect"/>
+        <pathelement location="${build-quick.dir}/classes/compiler"/>
+        <pathelement location="${sbt.interface.jar}"/>
+        <path refid="forkjoin.classpath"/>
+      </compilationpath>
+    </scalacfork>
+    <touch file="${build-sbt.dir}/sbt-interface.complete" verbose="no"/>
+    <stopwatch name="quick.sbt-interface.timer" action="total"/>
+  </target>
+
+  <target name="sbt.done" depends="sbt.compile">
+  </target>
+
+  <target name="sbt.clean" depends="init">
+    <delete dir="${build-sbt.dir}" includeemptydirs="yes" quiet="yes" failonerror="no"/>
   </target>
 
 <!-- ===========================================================================
@@ -2072,8 +2243,9 @@ DOCUMENTATION
     <property name="scaladoc.url" value="https://github.com/scala/scala/tree/${scaladoc.git.commit}/src"/>
     <echo message="Scaladoc will point to ${scaladoc.url} for source files."/>
 
-    <!-- Unless set with -Dscaladoc.raw.output, it won't be activated -->
+    <!-- Unless set with -Dscaladoc.<...>, these won't be activated -->
     <property name="scaladoc.raw.output" value="no"/>
+    <property name="scaladoc.no.prefixes" value="no"/>
   </target>
 
   <target name="docs.pre-lib" depends="docs.start">
@@ -2097,11 +2269,16 @@ DOCUMENTATION
       docfooter="epfl"
       docsourceurl="${scaladoc.url}€{FILE_PATH}.scala#L1"
       docUncompilable="${src.dir}/library-aux"
+      skipPackages="scala.reflect.macros.internal"
       sourcepath="${src.dir}"
       classpathref="pack.classpath"
       addparams="${scalac.args.all}"
       docRootContent="${src.dir}/library/rootdoc.txt"
-      implicits="on" diagrams="on" rawOutput="${scaladoc.raw.output}">
+      implicits="on"
+      diagrams="on"
+      groups="on"
+      rawOutput="${scaladoc.raw.output}"
+      noPrefixes="${scaladoc.no.prefixes}">
       <src>
         <files includes="${src.dir}/actors-migration"/>
         <files includes="${src.dir}/actors"/>
@@ -2185,7 +2362,11 @@ DOCUMENTATION
       srcdir="${src.dir}/compiler"
       docRootContent="${src.dir}/compiler/rootdoc.txt"
       addparams="${scalac.args.all}"
-      implicits="on" diagrams="on" rawOutput="${scaladoc.raw.output}">
+      implicits="on"
+      diagrams="on"
+      groups="on"
+      rawOutput="${scaladoc.raw.output}"
+      noPrefixes="${scaladoc.no.prefixes}">
       <include name="**/*.scala"/>
     </scaladoc>
     <touch file="${build-docs.dir}/compiler.complete" verbose="no"/>
@@ -2207,7 +2388,11 @@ DOCUMENTATION
       classpathref="pack.classpath"
       srcdir="${src.dir}/jline/src/main/java"
       addparams="${scalac.args.all}"
-      implicits="on" diagrams="on" rawOutput="${scaladoc.raw.output}">
+      implicits="on"
+      diagrams="on"
+      groups="on"
+      rawOutput="${scaladoc.raw.output}"
+      noPrefixes="${scaladoc.no.prefixes}">
       <include name="**/*.scala"/>
       <include name="**/*.java"/>
     </scaladoc>
@@ -2231,7 +2416,11 @@ DOCUMENTATION
       classpathref="pack.classpath"
       srcdir="${src.dir}/scalap"
       addparams="${scalac.args.all}"
-      implicits="on" diagrams="on" rawOutput="${scaladoc.raw.output}">
+      implicits="on"
+      diagrams="on"
+      groups="on"
+      rawOutput="${scaladoc.raw.output}"
+      noPrefixes="${scaladoc.no.prefixes}">
       <include name="**/*.scala"/>
     </scaladoc>
     <touch file="${build-docs.dir}/scalap.complete" verbose="no"/>
@@ -2253,7 +2442,11 @@ DOCUMENTATION
       classpathref="pack.classpath"
       srcdir="${src.dir}/partest"
       addparams="${scalac.args.all}"
-      implicits="on" diagrams="on" rawOutput="${scaladoc.raw.output}">
+      implicits="on"
+      diagrams="on"
+      groups="on"
+      rawOutput="${scaladoc.raw.output}"
+      noPrefixes="${scaladoc.no.prefixes}">
       <include name="**/*.scala"/>
     </scaladoc>
     <touch file="${build-docs.dir}/partest.complete" verbose="no"/>
@@ -2275,7 +2468,11 @@ DOCUMENTATION
       classpathref="pack.classpath"
       srcdir="${src.dir}/continuations/plugin"
       addparams="${scalac.args.all}"
-      implicits="on" diagrams="on" rawOutput="${scaladoc.raw.output}">
+      implicits="on"
+      diagrams="on"
+      groups="on"
+      rawOutput="${scaladoc.raw.output}"
+      noPrefixes="${scaladoc.no.prefixes}">
       <include name="**/*.scala"/>
     </scaladoc>
     <touch file="${build-docs.dir}/continuations-plugin.complete" verbose="no"/>
@@ -2297,7 +2494,11 @@ DOCUMENTATION
       classpathref="pack.classpath"
       srcdir="${src.dir}/actors-migration"
       addparams="${scalac.args.all}"
-      implicits="on" diagrams="on" rawOutput="${scaladoc.raw.output}">
+      implicits="on"
+      diagrams="on"
+      groups="on"
+      rawOutput="${scaladoc.raw.output}"
+      noPrefixes="${scaladoc.no.prefixes}">
       <include name="**/*.scala"/>
     </scaladoc>
     <touch file="${build-docs.dir}/actors-migration.complete" verbose="no"/>
@@ -2330,6 +2531,10 @@ BOOTRAPING TEST AND TEST SUITE
   <target name="test.classload" depends="pack.done">
     <!-- TODO - Add actors + reflect to this -->
     <classloadVerify classpath="${build-pack.dir}/lib/scala-library.jar" />
+  </target>
+
+  <!-- this target will run only those tests found in test/debug -->
+  <target name="test.sbt" depends="sbt.done">
   </target>
 
   <!-- this target will run only those tests found in test/debug -->
@@ -2393,6 +2598,9 @@ BOOTRAPING TEST AND TEST SUITE
       <specializedtests dir="${partest.dir}/${partest.srcdir}/specialized">
         <include name="*.scala"/>
       </specializedtests>
+      <instrumentedtests dir="${partest.dir}/${partest.srcdir}/instrumented">
+        <include name="*.scala"/>
+      </instrumentedtests>
       <presentationtests dir="${partest.dir}/${partest.srcdir}/presentation">
         <include name="*/*.scala"/>
       </presentationtests>
@@ -2428,7 +2636,7 @@ BOOTRAPING TEST AND TEST SUITE
     </partest>
   </target>
 
-  <target name="test.done" depends="test.suite, test.continuations.suite, test.scaladoc, test.stability"/>
+  <target name="test.done" depends="test.suite, test.continuations.suite, test.scaladoc, test.stability, test.sbt"/>
 
 <!-- ===========================================================================
 DISTRIBUTION
@@ -2544,7 +2752,7 @@ TEST AND DISTRIBUTION BUNDLE (ALL)
 
   <target name="all.done" depends="dist.done, test.done"/>
 
-  <target name="all.clean" depends="locker.clean, docs.clean, dist.clean"/>
+  <target name="all.clean" depends="locker.clean, docs.clean, dist.clean, sbt.clean, osgi.clean"/>
 
 <!-- ===========================================================================
 STABLE REFERENCE (STARR)

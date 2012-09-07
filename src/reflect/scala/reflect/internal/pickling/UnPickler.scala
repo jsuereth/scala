@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -230,9 +230,11 @@ abstract class UnPickler /*extends reflect.generic.UnPickler*/ {
           fromName(nme.expandedName(name.toTermName, owner)) orElse {
             // (3) Try as a nested object symbol.
             nestedObjectSymbol orElse {
-              // (4) Otherwise, fail.
-              //System.err.println("missing "+name+" in "+owner+"/"+owner.id+" "+owner.info.decls)
-              adjust(errorMissingRequirement(name, owner))
+              // (4) Call the mirror's "missing" hook.
+              adjust(mirrorThatLoaded(owner).missingHook(owner, name)) orElse {
+                // (5) Create a stub symbol to defer hard failure a little longer.
+                owner.newStubSymbol(name)
+              }
             }
           }
         }
@@ -767,8 +769,21 @@ abstract class UnPickler /*extends reflect.generic.UnPickler*/ {
     }
 
     /* Read a reference to a pickled item */
+    protected def readSymbolRef(): Symbol             = {//OPT inlined from: at(readNat(), readSymbol) to save on closure creation
+      val i = readNat()
+      var r = entries(i)
+      if (r eq null) {
+        val savedIndex = readIndex
+        readIndex = index(i)
+        r = readSymbol()
+        assert(entries(i) eq null, entries(i))
+        entries(i) = r
+        readIndex = savedIndex
+      }
+      r.asInstanceOf[Symbol]
+    }
+
     protected def readNameRef(): Name                 = at(readNat(), readName)
-    protected def readSymbolRef(): Symbol             = at(readNat(), readSymbol)
     protected def readTypeRef(): Type                 = at(readNat(), () => readType()) // after the NMT_TRANSITION period, we can leave off the () => ... ()
     protected def readConstantRef(): Constant         = at(readNat(), readConstant)
     protected def readAnnotationRef(): AnnotationInfo = at(readNat(), readAnnotation)

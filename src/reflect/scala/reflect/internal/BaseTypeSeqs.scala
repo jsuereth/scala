@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 package scala.reflect
@@ -39,8 +39,8 @@ trait BaseTypeSeqs {
    */
   class BaseTypeSeq protected[BaseTypeSeqs] (private[BaseTypeSeqs] val parents: List[Type], private[BaseTypeSeqs] val elems: Array[Type]) {
   self =>
-    Statistics.incCounter(baseTypeSeqCount)
-    Statistics.incCounter(baseTypeSeqLenTotal, elems.length)
+    if (Statistics.canEnable) Statistics.incCounter(baseTypeSeqCount)
+    if (Statistics.canEnable) Statistics.incCounter(baseTypeSeqLenTotal, elems.length)
 
     /** The number of types in the sequence */
     def length: Int = elems.length
@@ -226,7 +226,7 @@ trait BaseTypeSeqs {
     override def map(g: Type => Type) = lateMap(g)
     override def lateMap(g: Type => Type) = orig.lateMap(x => g(f(x)))
     override def exists(p: Type => Boolean) = elems exists (x => p(f(x)))
-    override protected def maxDepthOfElems: Int = elems map (x => typeDepth(f(x))) max
+    override protected def maxDepthOfElems: Int = elems.map(x => typeDepth(f(x))).max
     override def toString = elems.mkString("MBTS(", ",", ")")
   }
 

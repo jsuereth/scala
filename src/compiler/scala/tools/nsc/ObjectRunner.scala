@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Lex Spoon
  */
 
@@ -33,7 +33,7 @@ trait CommonRunner {
    */
   def runAndCatch(urls: List[URL], objectName: String, arguments: Seq[String]): Either[Throwable, Boolean] = {
     try   { run(urls, objectName, arguments) ; Right(true) }
-    catch { case e => Left(unwrap(e)) }
+    catch { case e: Throwable => Left(unwrap(e)) }
   }
 }
 

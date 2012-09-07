@@ -44,7 +44,8 @@ import scala.tools.nsc.reporters.{Reporter, ConsoleReporter}
  *  - `docgenerator`,
  *  - `docrootcontent`,
  *  - `unchecked`,
- *  - `nofail`.
+ *  - `nofail`,
+ *  - `skipPackages`.
  *
  *  It also takes the following parameters as nested elements:
  *  - `src` (for srcdir),
@@ -153,6 +154,14 @@ class Scaladoc extends ScalaMatchingTask {
   /** Instruct the scaladoc to produce textual ouput from html pages, for easy diff-ing */
   private var docRawOutput: Boolean = false
 
+  /** Instruct the scaladoc not to generate prefixes */
+  private var docNoPrefixes: Boolean = false
+
+  /** Instruct the scaladoc tool to group similar functions together */
+  private var docGroups: Boolean = false
+
+  /** Instruct the scaladoc tool to skip certain packages */
+  private var docSkipPackages: String = ""
 
 /*============================================================================*\
 **                             Properties setters                             **
@@ -427,6 +436,22 @@ class Scaladoc extends ScalaMatchingTask {
   def setRawOutput(input: String) =
     docRawOutput = Flag.getBooleanValue(input, "rawOutput")
 
+  /** Set the `noPrefixes` bit to prevent Scaladoc from generating prefixes in
+   *  front of types -- may lead to confusion, but significantly speeds up the generation.
+   *  @param input One of the flags `yes/no` or `on/off`. Default if no/off. */
+  def setNoPrefixes(input: String) =
+    docNoPrefixes = Flag.getBooleanValue(input, "noPrefixes")
+
+  /** Instruct the scaladoc tool to group similar functions together */
+  def setGroups(input: String) =
+    docGroups = Flag.getBooleanValue(input, "groups")
+
+  /** Instruct the scaladoc tool to skip certain packages.
+   *  @param input A colon-delimited list of fully qualified package names that will be skipped from scaladoc.
+   */
+  def setSkipPackages(input: String) =
+    docSkipPackages = input
+
 /*============================================================================*\
 **                             Properties getters                             **
 \*============================================================================*/
@@ -625,6 +650,9 @@ class Scaladoc extends ScalaMatchingTask {
     docSettings.docDiagrams.value = docDiagrams
     docSettings.docDiagramsDebug.value = docDiagramsDebug
     docSettings.docRawOutput.value = docRawOutput
+    docSettings.docNoPrefixes.value = docNoPrefixes
+    docSettings.docGroups.value = docGroups
+    docSettings.docSkipPackages.value = docSkipPackages
     if(!docDiagramsDotPath.isEmpty) docSettings.docDiagramsDotPath.value = docDiagramsDotPath.get
 
     if (!docgenerator.isEmpty) docSettings.docgenerator.value = docgenerator.get
@@ -658,15 +686,10 @@ class Scaladoc extends ScalaMatchingTask {
           "; see the documenter output for details.")
       reporter.printSummary()
     } catch {
-      case exception: Throwable if exception.getMessage ne null =>
+      case exception: Throwable =>
         exception.printStackTrace()
-        safeBuildError("Document failed because of an internal documenter error (" +
-          exception.getMessage + "); see the error output for details.")
-      case exception =>
-        exception.printStackTrace()
-        safeBuildError("Document failed because of an internal documenter error " +
-          "(no error message provided); see the error output for details.")
+        val msg = Option(exception.getMessage) getOrElse "no error message provided"
+        safeBuildError(s"Document failed because of an internal documenter error ($msg); see the error output for details.")
     }
   }
-
 }

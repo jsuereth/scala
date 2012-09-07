@@ -1,5 +1,5 @@
 /* NEST (New Scala Test)
- * Copyright 2007-2011 LAMP/EPFL
+ * Copyright 2007-2012 LAMP/EPFL
  * @author Philipp Haller
  */
 
@@ -80,6 +80,7 @@ object NestUI {
     println("    --scalacheck    run ScalaCheck tests")
     println("    --script        run script runner tests")
     println("    --shootout      run shootout tests")
+    println("    --instrumented  run instrumented tests")
     println("    --presentation  run presentation compiler tests")
     println("    --grep <expr>    run all tests whose source file contains <expr>")
     println

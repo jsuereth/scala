@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -140,7 +140,7 @@ abstract class TreeBrowsers {
       UIManager.setLookAndFeel("com.sun.java.swing.plaf.nimbus.NimbusLookAndFeel")
     }
     catch {
-      case _ => UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName())
+      case _: Throwable => UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName())
     }
 
     val frame = new JFrame("Scala AST after " + phaseName + " phase")

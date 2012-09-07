@@ -1,6 +1,6 @@
 /* NSC -- new Scala compiler
  *
- * Copyright 2012 LAMP/EPFL
+ * Copyright 2011-2012 LAMP/EPFL
  * @author Adriaan Moors
  */
 
@@ -8,13 +8,14 @@ package scala.tools.nsc
 package typechecker
 
 import symtab._
-import Flags.{MUTABLE, METHOD, LABEL, SYNTHETIC, HIDDEN}
+import Flags.{MUTABLE, METHOD, LABEL, SYNTHETIC, ARTIFACT}
 import language.postfixOps
 import scala.tools.nsc.transform.TypingTransformers
 import scala.tools.nsc.transform.Transform
 import scala.collection.mutable.HashSet
 import scala.collection.mutable.HashMap
 import reflect.internal.util.Statistics
+import scala.reflect.internal.Types
 
 /** Translate pattern matching.
   *
@@ -27,14 +28,13 @@ import reflect.internal.util.Statistics
   * Cases are combined into a pattern match using the `orElse` combinator (the implicit failure case is expressed using the monad's `zero`).
   *
   * TODO:
-  *  - use TypeTags for type testing
   *  - DCE (on irrefutable patterns)
   *  - update spec and double check it's implemented correctly (see TODO's)
   *
   * (longer-term) TODO:
   *  - user-defined unapplyProd
   *  - recover GADT typing by locally inserting implicit witnesses to type equalities derived from the current case, and considering these witnesses during subtyping (?)
-  *  - recover exhaustivity and unreachability checking using a variation on the type-safe builder pattern
+  *  - recover exhaustivity/unreachability of user-defined extractors by partitioning the types they match on using an HList or similar type-level structure
   */
 trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL {   // self: Analyzer =>
   import Statistics._
@@ -48,8 +48,26 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
   val phaseName: String = "patmat"
 
   // TODO: the inliner fails to inline the closures to patmatDebug
-  // private val printPatmat = settings.Ypatmatdebug.value
-  // @inline final def patmatDebug(s: => String) = if (printPatmat) println(s)
+  object debugging {
+    val printPatmat = settings.Ypatmatdebug.value
+    @inline final def patmatDebug(s: => String) = if (printPatmat) println(s)
+  }
+  import debugging.patmatDebug
+
+  // to govern how much time we spend analyzing matches for unreachability/exhaustivity
+  object AnalysisBudget {
+    import scala.tools.cmd.FromString.IntFromString
+    val max = sys.props.get("scalac.patmat.analysisBudget").collect(IntFromString.orElse{case "off" => Integer.MAX_VALUE}).getOrElse(256)
+
+    abstract class Exception extends RuntimeException("CNF budget exceeded") {
+      val advice: String
+      def warn(pos: Position, kind: String) = currentUnit.uncheckedWarning(pos, s"Cannot check match for $kind.\n$advice")
+    }
+
+    object exceeded extends Exception {
+      val advice = s"(The analysis required more space than allowed. Please try with scalac -Dscalac.patmat.analysisBudget=${AnalysisBudget.max*2} or -Dscalac.patmat.analysisBudget=off.)"
+    }
+  }
 
   def newTransformer(unit: CompilationUnit): Transformer =
     if (opt.virtPatmat) new MatchTransformer(unit)
@@ -69,7 +87,15 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       case Match(sel, cases) =>
         val origTp = tree.tpe
         // setType origTp intended for CPS -- TODO: is it necessary?
-        localTyper.typed(translator.translateMatch(treeCopy.Match(tree, transform(sel), transformTrees(cases).asInstanceOf[List[CaseDef]]))) setType origTp
+        val translated = translator.translateMatch(treeCopy.Match(tree, transform(sel), transformTrees(cases).asInstanceOf[List[CaseDef]]))
+        try {
+          localTyper.typed(translated) setType origTp
+        } catch {
+          case x: (Types#TypeError) =>
+            // TODO: this should never happen; error should've been reported during type checking
+            unit.error(tree.pos, "error during expansion of this match (this is a scalac bug).\nThe underlying error was: "+ x.msg)
+            translated
+        }
       case Try(block, catches, finalizer) =>
         treeCopy.Try(tree, transform(block), translator.translateTry(transformTrees(catches).asInstanceOf[List[CaseDef]], tree.tpe, tree.pos), transform(finalizer))
       case _ => super.transform(tree)
@@ -83,7 +109,6 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
   import definitions._
   import analyzer._ //Typer
 
-  val SYNTH_CASE = Flags.CASE | SYNTHETIC
 
   case class DefaultOverrideMatchAttachment(default: Tree)
 
@@ -169,6 +194,69 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     import typer.{typed, context, silent, reallyExists}
     // import typer.infer.containsUnchecked
 
+    // Why is it so difficult to say "here's a name and a context, give me any
+    // matching symbol in scope" ? I am sure this code is wrong, but attempts to
+    // use the scopes of the contexts in the enclosing context chain discover
+    // nothing. How to associate a name with a symbol would would be a wonderful
+    // linkage for which to establish a canonical acquisition mechanism.
+    def matchingSymbolInScope(pat: Tree): Symbol = {
+      def declarationOfName(tpe: Type, name: Name): Symbol = tpe match {
+        case PolyType(tparams, restpe)  => tparams find (_.name == name) getOrElse declarationOfName(restpe, name)
+        case MethodType(params, restpe) => params find (_.name == name) getOrElse declarationOfName(restpe, name)
+        case ClassInfoType(_, _, clazz) => clazz.rawInfo member name
+        case _                          => NoSymbol
+      }
+      pat match {
+        case Bind(name, _) =>
+          context.enclosingContextChain.foldLeft(NoSymbol: Symbol)((res, ctx) =>
+            res orElse declarationOfName(ctx.owner.rawInfo, name))
+        case _ => NoSymbol
+      }
+    }
+
+    // Issue better warnings than "unreachable code" when people mis-use
+    // variable patterns thinking they bind to existing identifiers.
+    //
+    // Possible TODO: more deeply nested variable patterns, like
+    //   case (a, b) => 1 ; case (c, d) => 2
+    // However this is a pain (at least the way I'm going about it)
+    // and I have to think these detailed errors are primarily useful
+    // for beginners, not people writing nested pattern matches.
+    def checkMatchVariablePatterns(m: Match) {
+      // A string describing the first variable pattern
+      var vpat: String = null
+      // Using an iterator so we can recognize the last case
+      val it = m.cases.iterator
+
+      def addendum(pat: Tree) = {
+        matchingSymbolInScope(pat) match {
+          case NoSymbol   => ""
+          case sym        =>
+            val desc = if (sym.isParameter) s"parameter ${sym.nameString} of" else sym + " in"
+            s"\nIf you intended to match against $desc ${sym.owner}, you must use backticks, like: case `${sym.nameString}` =>"
+        }
+      }
+
+      while (it.hasNext) {
+        val cdef = it.next
+        // If a default case has been seen, then every succeeding case is unreachable.
+        if (vpat != null)
+          context.unit./*error*/warning(cdef.body.pos, "unreachable code due to " + vpat + addendum(cdef.pat))
+        // If this is a default case and more cases follow, warn about this one so
+        // we have a reason to mention its pattern variable name and any corresponding
+        // symbol in scope.  Errors will follow from the remaining cases, at least
+        // once we make the above warning an error.
+        else if (it.hasNext && (treeInfo isDefaultCase cdef)) {
+          val vpatName = cdef.pat match {
+            case Bind(name, _)   => s" '$name'"
+            case _               => ""
+          }
+          vpat = s"variable pattern$vpatName on line ${cdef.pat.pos.line}"
+          context.unit.warning(cdef.pos, s"patterns after a variable pattern cannot match (SLS 8.1.1)" + addendum(cdef.pat))
+        }
+      }
+    }
+
     /** Implement a pattern match by turning its cases (including the implicit failure case)
       * into the corresponding (monadic) extractors, and combining them with the `orElse` combinator.
       *
@@ -181,19 +269,15 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       */
     def translateMatch(match_ : Match): Tree = {
       val Match(selector, cases) = match_
+      checkMatchVariablePatterns(match_)
 
       // we don't transform after uncurry
       // (that would require more sophistication when generating trees,
       //  and the only place that emits Matches after typers is for exception handling anyway)
       if(phase.id >= currentRun.uncurryPhase.id) debugwarn("running translateMatch at "+ phase +" on "+ selector +" match "+ cases)
-      // patmatDebug ("translating "+ cases.mkString("{", "\n", "}"))
+      patmatDebug("translating "+ cases.mkString("{", "\n", "}"))
 
-      def repeatedToSeq(tp: Type): Type = (tp baseType RepeatedParamClass) match {
-        case TypeRef(_, RepeatedParamClass, arg :: Nil) => seqType(arg)
-        case _                                          => tp
-      }
-
-      val start = Statistics.startTimer(patmatNanos)
+      val start = if (Statistics.canEnable) Statistics.startTimer(patmatNanos) else null
 
       val selectorTp = repeatedToSeq(elimAnonymousClass(selector.tpe.widen.withoutAnnotations))
 
@@ -206,21 +290,22 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
           removeCPSAdaptAnnotations(origPt)
         else origPt
 
-      // we've packed the type for each case in typedMatch so that if all cases have the same existential case, we get a clean lub
-      // here, we should open up the existential again
       // relevant test cases: pos/existentials-harmful.scala, pos/gadt-gilles.scala, pos/t2683.scala, pos/virtpatmat_exist4.scala
-      // TODO: fix skolemizeExistential (it should preserve annotations, right?)
-      val pt = repeatedToSeq(ptUnCPS.skolemizeExistential(context.owner, context.tree) withAnnotations ptUnCPS.annotations)
+      // pt is the skolemized version
+      val pt = repeatedToSeq(ptUnCPS)
+
+      // val packedPt = repeatedToSeq(typer.packedType(match_, context.owner))
 
       // the alternative to attaching the default case override would be to simply
       // append the default to the list of cases and suppress the unreachable case error that may arise (once we detect that...)
       val matchFailGenOverride = match_.attachments.get[DefaultOverrideMatchAttachment].map{case DefaultOverrideMatchAttachment(default) => ((scrut: Tree) => default)}
 
-      val selectorSym  = freshSym(selector.pos, pureType(selectorTp)) setFlag SYNTH_CASE
+      val selectorSym = freshSym(selector.pos, pureType(selectorTp)) setFlag treeInfo.SYNTH_CASE_FLAGS
+
       // pt = Any* occurs when compiling test/files/pos/annotDepMethType.scala  with -Xexperimental
       val combined = combineCases(selector, selectorSym, cases map translateCase(selectorSym, pt), pt, matchOwner, matchFailGenOverride)
 
-      Statistics.stopTimer(patmatNanos, start)
+      if (Statistics.canEnable) Statistics.stopTimer(patmatNanos, start)
       combined
     }
 
@@ -311,14 +396,14 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         if (!extractor.isTyped) ErrorUtils.issueNormalTypeError(patTree, "Could not typecheck extractor call: "+ extractor)(context)
         // if (extractor.resultInMonad == ErrorType) throw new TypeError(pos, "Unsupported extractor type: "+ extractor.tpe)
 
-        // patmatDebug ("translateExtractorPattern checking parameter type: "+ (patBinder, patBinder.info.widen, extractor.paramType, patBinder.info.widen <:< extractor.paramType))
+        patmatDebug("translateExtractorPattern checking parameter type: "+ (patBinder, patBinder.info.widen, extractor.paramType, patBinder.info.widen <:< extractor.paramType))
 
         // must use type `tp`, which is provided by extractor's result, not the type expected by binder,
         // as b.info may be based on a Typed type ascription, which has not been taken into account yet by the translation
         // (it will later result in a type test when `tp` is not a subtype of `b.info`)
         // TODO: can we simplify this, together with the Bound case?
         (extractor.subPatBinders, extractor.subPatTypes).zipped foreach { case (b, tp) =>
-          // patmatDebug ("changing "+ b +" : "+ b.info +" -> "+ tp)
+          patmatDebug("changing "+ b +" : "+ b.info +" -> "+ tp)
           b setInfo tp
         }
 
@@ -387,8 +472,9 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         **/
         // must treat Typed and Bind together -- we need to know the patBinder of the Bind pattern to get at the actual type
         case MaybeBoundTyped(subPatBinder, pt) =>
+          val next = glb(List(patBinder.info.widen, pt)).normalize
           // a typed pattern never has any subtrees
-          noFurtherSubPats(TypeTestTreeMaker(subPatBinder, patBinder, pt, glb(List(patBinder.info.widen, pt)).normalize)(pos))
+          noFurtherSubPats(TypeTestTreeMaker(subPatBinder, patBinder, pt, next)(pos))
 
         /** A pattern binder x@p consists of a pattern variable x and a pattern p.
             The type of the variable x is the static type T of the pattern p.
@@ -411,7 +497,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
               The pattern matches any value v such that r == v (§12.1).
               The type of r must conform to the expected type of the pattern.
         **/
-        case Literal(Constant(_)) | Ident(_) | Select(_, _) =>
+        case Literal(Constant(_)) | Ident(_) | Select(_, _) | This(_) =>
           noFurtherSubPats(EqualityTestTreeMaker(patBinder, patTree, pos))
 
         case Alternative(alts)    =>
@@ -425,13 +511,13 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       */
 
         case Bind(n, p) => // this happens in certain ill-formed programs, there'll be an error later
-          // patmatDebug ("WARNING: Bind tree with unbound symbol "+ patTree)
+          patmatDebug("WARNING: Bind tree with unbound symbol "+ patTree)
           noFurtherSubPats() // there's no symbol -- something's wrong... don't fail here though (or should we?)
 
-        // case Star(_) | ArrayValue | This => error("stone age pattern relics encountered!")
+        // case Star(_) | ArrayValue  => error("stone age pattern relics encountered!")
 
         case _                       =>
-          error("unsupported pattern: "+ patTree +"(a "+ patTree.getClass +")")
+          typer.context.unit.error(patTree.pos, s"unsupported pattern: $patTree (a ${patTree.getClass}).\n This is a scalac bug. Tree diagnostics: ${asCompactDebugString(patTree)}.")
           noFurtherSubPats()
       }
 
@@ -545,7 +631,10 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         if(isSeq) {
           val TypeRef(pre, SeqClass, args) = seqTp
           // do repeated-parameter expansion to match up with the expected number of arguments (in casu, subpatterns)
-          formalTypes(rawSubPatTypes.init :+ typeRef(pre, RepeatedParamClass, args), nbSubPats)
+          val formalsWithRepeated = rawSubPatTypes.init :+ typeRef(pre, RepeatedParamClass, args)
+
+          if (lastIsStar) formalTypes(formalsWithRepeated, nbSubPats - 1) :+ seqTp
+          else formalTypes(formalsWithRepeated, nbSubPats)
         } else rawSubPatTypes
 
       protected def rawSubPatTypes: List[Type]
@@ -634,8 +723,15 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
 
       // binder has type paramType
       def treeMaker(binder: Symbol, pos: Position): TreeMaker = {
+        val paramAccessors = binder.constrParamAccessors
+        // binders corresponding to mutable fields should be stored (SI-5158, SI-6070)
+        val mutableBinders =
+          if (paramAccessors exists (_.isMutable))
+            subPatBinders.zipWithIndex.collect{ case (binder, idx) if paramAccessors(idx).isMutable => binder }
+          else Nil
+
         // checks binder ne null before chaining to the next extractor
-        ProductExtractorTreeMaker(binder, lengthGuard(binder), Substitution(subPatBinders, subPatRefs(binder)))
+        ProductExtractorTreeMaker(binder, lengthGuard(binder))(subPatBinders, subPatRefs(binder), mutableBinders)
       }
 
       // reference the (i-1)th case accessor if it exists, otherwise the (i-1)th tuple component
@@ -679,7 +775,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         // the extractor call (applied to the binder bound by the flatMap corresponding to the previous (i.e., enclosing/outer) pattern)
         val extractorApply = atPos(pos)(spliceApply(patBinderOrCasted))
         val binder         = freshSym(pos, pureType(resultInMonad)) // can't simplify this when subPatBinders.isEmpty, since UnitClass.tpe is definitely wrong when isSeq, and resultInMonad should always be correct since it comes directly from the extractor's result type
-        ExtractorTreeMaker(extractorApply, lengthGuard(binder), binder, Substitution(subPatBinders, subPatRefs(binder)))(resultType.typeSymbol == BooleanClass, checkedLength, patBinderOrCasted)
+        ExtractorTreeMaker(extractorApply, lengthGuard(binder), binder)(subPatBinders, subPatRefs(binder), resultType.typeSymbol == BooleanClass, checkedLength, patBinderOrCasted)
       }
 
       override protected def seqTree(binder: Symbol): Tree =
@@ -828,12 +924,26 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
 
       private[TreeMakers] def incorporateOuterSubstitution(outerSubst: Substitution): Unit = {
         if (currSub ne null) {
-          // patmatDebug ("BUG: incorporateOuterSubstitution called more than once for "+ (this, currSub, outerSubst))
+          patmatDebug("BUG: incorporateOuterSubstitution called more than once for "+ (this, currSub, outerSubst))
           Thread.dumpStack()
         }
         else currSub = outerSubst >> substitution
       }
       private[this] var currSub: Substitution = null
+
+      /** The substitution that specifies the trees that compute the values of the subpattern binders.
+       *
+       * Should not be used to perform actual substitution!
+       * Only used to reason symbolically about the values the subpattern binders are bound to.
+       * See TreeMakerToCond#updateSubstitution.
+       *
+       * Overridden in PreserveSubPatBinders to pretend it replaces the subpattern binders by subpattern refs
+       * (Even though we don't do so anymore -- see SI-5158, SI-5739 and SI-6070.)
+       *
+       * TODO: clean this up, would be nicer to have some higher-level way to compute
+       * the binders bound by this tree maker and the symbolic values that correspond to them
+       */
+      def subPatternsAsSubstitution: Substitution = substitution
 
       // build Tree that chains `next` after the current extractor
       def chainBefore(next: Tree)(casegen: Casegen): Tree
@@ -883,32 +993,115 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         atPos(pos)(casegen.flatMapCond(cond, res, nextBinder, substitution(next)))
     }
 
+    // unless we're optimizing, emit local variable bindings for all subpatterns of extractor/case class patterns
+    protected val debugInfoEmitVars = !settings.optimise.value
+
+    trait PreserveSubPatBinders extends TreeMaker {
+      val subPatBinders: List[Symbol]
+      val subPatRefs: List[Tree]
+
+      // unless `debugInfoEmitVars`, this set should contain the bare minimum for correctness
+      // mutable case class fields need to be stored regardless (SI-5158, SI-6070) -- see override in ProductExtractorTreeMaker
+      def storedBinders: Set[Symbol] = if (debugInfoEmitVars) subPatBinders.toSet else Set.empty
+
+      def emitVars = storedBinders.nonEmpty
+
+      private lazy val (stored, substed) = (subPatBinders, subPatRefs).zipped.partition{ case (sym, _) => storedBinders(sym) }
+
+      protected lazy val localSubstitution: Substitution = if (!emitVars) Substitution(subPatBinders, subPatRefs)
+        else {
+          val (subPatBindersSubstituted, subPatRefsSubstituted) = substed.unzip
+          Substitution(subPatBindersSubstituted.toList, subPatRefsSubstituted.toList)
+        }
+
+      /** The substitution that specifies the trees that compute the values of the subpattern binders.
+       *
+       * We pretend to replace the subpattern binders by subpattern refs
+       * (Even though we don't do so anymore -- see SI-5158, SI-5739 and SI-6070.)
+       */
+      override def subPatternsAsSubstitution =
+        Substitution(subPatBinders, subPatRefs) >> super.subPatternsAsSubstitution
+
+      import CODE._
+      def bindSubPats(in: Tree): Tree = if (!emitVars) in
+        else {
+          val (subPatBindersStored, subPatRefsStored) = stored.unzip
+          Block(map2(subPatBindersStored.toList, subPatRefsStored.toList)(VAL(_) === _), in)
+        }
+    }
+
     /**
      * Make a TreeMaker that will result in an extractor call specified by `extractor`
      * the next TreeMaker (here, we don't know which it'll be) is chained after this one by flatMap'ing
      * a function with binder `nextBinder` over our extractor's result
      * the function's body is determined by the next TreeMaker
-     * in this function's body, and all the subsequent ones, references to the symbols in `from` will be replaced by the corresponding tree in `to`
+     * (furthermore, the interpretation of `flatMap` depends on the codegen instance we're using).
+     *
+     * The values for the subpatterns, as computed by the extractor call in `extractor`,
+     * are stored in local variables that re-use the symbols in `subPatBinders`.
+     * This makes extractor patterns more debuggable (SI-5739).
      */
-    case class ExtractorTreeMaker(extractor: Tree, extraCond: Option[Tree], nextBinder: Symbol, localSubstitution: Substitution)(extractorReturnsBoolean: Boolean, val checkedLength: Option[Int], val prevBinder: Symbol) extends FunTreeMaker {
+    case class ExtractorTreeMaker(extractor: Tree, extraCond: Option[Tree], nextBinder: Symbol)(
+          val subPatBinders: List[Symbol],
+          val subPatRefs: List[Tree],
+          extractorReturnsBoolean: Boolean,
+          val checkedLength: Option[Int],
+          val prevBinder: Symbol) extends FunTreeMaker with PreserveSubPatBinders {
+
       def chainBefore(next: Tree)(casegen: Casegen): Tree = {
-        val condAndNext = extraCond map (casegen.ifThenElseZero(_, next)) getOrElse next
+        val condAndNext = extraCond match {
+          case Some(cond) =>
+            casegen.ifThenElseZero(substitution(cond), bindSubPats(substitution(next)))
+          case _ =>
+            bindSubPats(substitution(next))
+        }
         atPos(extractor.pos)(
-          if (extractorReturnsBoolean) casegen.flatMapCond(extractor, CODE.UNIT, nextBinder, substitution(condAndNext))
-          else casegen.flatMap(extractor, nextBinder, substitution(condAndNext))
+          if (extractorReturnsBoolean) casegen.flatMapCond(extractor, CODE.UNIT, nextBinder, condAndNext)
+          else casegen.flatMap(extractor, nextBinder, condAndNext)
         )
       }
 
       override def toString = "X"+(extractor, nextBinder.name)
     }
 
-    // TODO: allow user-defined unapplyProduct
-    case class ProductExtractorTreeMaker(prevBinder: Symbol, extraCond: Option[Tree], localSubstitution: Substitution) extends FunTreeMaker { import CODE._
+    /**
+     * An optimized version of ExtractorTreeMaker for Products.
+     * For now, this is hard-coded to case classes, and we simply extract the case class fields.
+     *
+     * The values for the subpatterns, as specified by the case class fields at the time of extraction,
+     * are stored in local variables that re-use the symbols in `subPatBinders`.
+     * This makes extractor patterns more debuggable (SI-5739) as well as
+     * avoiding mutation after the pattern has been matched (SI-5158, SI-6070)
+     *
+     * TODO: make this user-definable as follows
+     *   When a companion object defines a method `def unapply_1(x: T): U_1`, but no `def unapply` or `def unapplySeq`,
+     *   the extractor is considered to match any non-null value of type T
+     *   the pattern is expected to have as many sub-patterns as there are `def unapply_I(x: T): U_I` methods,
+     *   and the type of the I'th sub-pattern is `U_I`.
+     *   The same exception for Seq patterns applies: if the last extractor is of type `Seq[U_N]`,
+     *   the pattern must have at least N arguments (exactly N if the last argument is annotated with `: _*`).
+     *   The arguments starting at N (and beyond) are taken from the sequence returned by apply_N,
+     *   and it is checked that that sequence has enough elements to provide values for all expected sub-patterns.
+     *
+     *   For a case class C, the implementation is assumed to be `def unapply_I(x: C) = x._I`,
+     *   and the extractor call is inlined under that assumption.
+     */
+    case class ProductExtractorTreeMaker(prevBinder: Symbol, extraCond: Option[Tree])(
+          val subPatBinders: List[Symbol],
+          val subPatRefs: List[Tree],
+          val mutableBinders: List[Symbol]) extends FunTreeMaker with PreserveSubPatBinders {
+
+      import CODE._
       val nextBinder = prevBinder // just passing through
+
+      // mutable binders must be stored to avoid unsoundness or seeing mutation of fields after matching (SI-5158, SI-6070)
+      // (the implementation could be optimized by duplicating code from `super.storedBinders`, but this seems more elegant)
+      override def storedBinders: Set[Symbol] = super.storedBinders ++ mutableBinders.toSet
+
       def chainBefore(next: Tree)(casegen: Casegen): Tree = {
         val nullCheck = REF(prevBinder) OBJ_NE NULL
         val cond = extraCond map (nullCheck AND _) getOrElse nullCheck
-        casegen.ifThenElseZero(cond, substitution(next))
+        casegen.ifThenElseZero(cond, bindSubPats(substitution(next)))
       }
 
       override def toString = "P"+(prevBinder.name,  extraCond getOrElse "", localSubstitution)
@@ -943,13 +1136,14 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
 
         def outerTest(testedBinder: Symbol, expectedTp: Type): Tree = {
           val expectedOuter = expectedTp.prefix match {
-            case ThisType(clazz)  => THIS(clazz)
-            case pre              => REF(pre.prefix, pre.termSymbol)
+            case ThisType(clazz)      => THIS(clazz)
+            case pre if pre != NoType => REF(pre.prefix, pre.termSymbol)
+            case _ => TRUE_typed // fallback for SI-6183
           }
 
           // ExplicitOuter replaces `Select(q, outerSym) OBJ_EQ expectedPrefix` by `Select(q, outerAccessor(outerSym.owner)) OBJ_EQ expectedPrefix`
           // if there's an outer accessor, otherwise the condition becomes `true` -- TODO: can we improve needsOuterTest so there's always an outerAccessor?
-          val outer = expectedTp.typeSymbol.newMethod(vpmName.outer) setInfo expectedTp.prefix setFlag SYNTHETIC | HIDDEN
+          val outer = expectedTp.typeSymbol.newMethod(vpmName.outer) setInfo expectedTp.prefix setFlag SYNTHETIC | ARTIFACT
 
           (Select(codegen._asInstanceOf(testedBinder, expectedTp), outer)) OBJ_EQ expectedOuter
         }
@@ -994,7 +1188,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     **/
     case class TypeTestTreeMaker(prevBinder: Symbol, testedBinder: Symbol, expectedTp: Type, nextBinderTp: Type)(override val pos: Position, extractorArgTypeTest: Boolean = false) extends CondTreeMaker {
       import TypeTestTreeMaker._
-      // patmatDebug ("TTTM"+(prevBinder, extractorArgTypeTest, testedBinder, expectedTp, nextBinderTp))
+      patmatDebug("TTTM"+(prevBinder, extractorArgTypeTest, testedBinder, expectedTp, nextBinderTp))
 
       lazy val outerTestNeeded = (
           !((expectedTp.prefix eq NoPrefix) || expectedTp.prefix.typeSymbol.isPackageClass)
@@ -1022,7 +1216,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         else expectedTp match {
           // TODO: [SPEC] the spec requires `eq` instead of `==` for singleton types
           // this implies sym.isStable
-          case SingleType(_, sym)                       => and(equalsTest(CODE.REF(sym), testedBinder), typeTest(testedBinder, expectedTp.widen))
+          case SingleType(_, sym)                       => and(equalsTest(gen.mkAttributedQualifier(expectedTp), testedBinder), typeTest(testedBinder, expectedTp.widen))
           // must use == to support e.g. List() == Nil
           case ThisType(sym) if sym.isModule            => and(equalsTest(CODE.REF(sym), testedBinder), typeTest(testedBinder, expectedTp.widen))
           case ConstantType(Constant(null)) if testedBinder.info.widen <:< AnyRefClass.tpe
@@ -1122,13 +1316,13 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     def combineCasesNoSubstOnly(scrut: Tree, scrutSym: Symbol, casesNoSubstOnly: List[List[TreeMaker]], pt: Type, owner: Symbol, matchFailGenOverride: Option[Tree => Tree]): Tree =
       fixerUpper(owner, scrut.pos){
         def matchFailGen = (matchFailGenOverride orElse Some(CODE.MATCHERROR(_: Tree)))
-        // patmatDebug ("combining cases: "+ (casesNoSubstOnly.map(_.mkString(" >> ")).mkString("{", "\n", "}")))
+        patmatDebug("combining cases: "+ (casesNoSubstOnly.map(_.mkString(" >> ")).mkString("{", "\n", "}")))
 
         val (unchecked, requireSwitch) =
           if (settings.XnoPatmatAnalysis.value) (true, false)
           else scrut match {
             case Typed(_, tpt) =>
-              (treeInfo.isUncheckedAnnotation(tpt.tpe),
+              (tpt.tpe hasAnnotation UncheckedClass,
                // matches with two or fewer cases need not apply for switchiness (if-then-else will do)
                treeInfo.isSwitchAnnotation(tpt.tpe) && casesNoSubstOnly.lengthCompare(2) > 0)
             case _ =>
@@ -1176,12 +1370,12 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         t match {
           case Function(_, _) if t.symbol == NoSymbol =>
             t.symbol = currentOwner.newAnonymousFunctionValue(t.pos)
-            // patmatDebug ("new symbol for "+ (t, t.symbol.ownerChain))
+            patmatDebug("new symbol for "+ (t, t.symbol.ownerChain))
           case Function(_, _) if (t.symbol.owner == NoSymbol) || (t.symbol.owner == origOwner) =>
-            // patmatDebug ("fundef: "+ (t, t.symbol.ownerChain, currentOwner.ownerChain))
+            patmatDebug("fundef: "+ (t, t.symbol.ownerChain, currentOwner.ownerChain))
             t.symbol.owner = currentOwner
           case d : DefTree if (d.symbol != NoSymbol) && ((d.symbol.owner == NoSymbol) || (d.symbol.owner == origOwner)) => // don't indiscriminately change existing owners! (see e.g., pos/t3440, pos/t3534, pos/unapplyContexts2)
-            // patmatDebug ("def: "+ (d, d.symbol.ownerChain, currentOwner.ownerChain))
+            patmatDebug("def: "+ (d, d.symbol.ownerChain, currentOwner.ownerChain))
             if(d.symbol.isLazy) { // for lazy val's accessor -- is there no tree??
               assert(d.symbol.lazyAccessor != NoSymbol && d.symbol.lazyAccessor.owner == d.symbol.owner, d.symbol.lazyAccessor)
               d.symbol.lazyAccessor.owner = currentOwner
@@ -1191,7 +1385,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
 
             d.symbol.owner = currentOwner
           // case _ if (t.symbol != NoSymbol) && (t.symbol ne null) =>
-          // patmatDebug ("untouched "+ (t, t.getClass, t.symbol.ownerChain, currentOwner.ownerChain))
+          patmatDebug("untouched "+ (t, t.getClass, t.symbol.ownerChain, currentOwner.ownerChain))
           case _ =>
         }
         super.traverse(t)
@@ -1217,13 +1411,16 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     def freshSym(pos: Position, tp: Type = NoType, prefix: String = "x") =
       NoSymbol.newTermSymbol(freshName(prefix), pos) setInfo tp
 
+    def newSynthCaseLabel(name: String) =
+      NoSymbol.newLabel(freshName(name), NoPosition) setFlag treeInfo.SYNTH_CASE_FLAGS
+
     // codegen relevant to the structure of the translation (how extractors are combined)
     trait AbsCodegen {
       def matcher(scrut: Tree, scrutSym: Symbol, restpe: Type)(cases: List[Casegen => Tree], matchFailGen: Option[Tree => Tree]): Tree
 
       // local / context-free
       def _asInstanceOf(b: Symbol, tp: Type): Tree
-      def _asInstanceOf(t: Tree, tp: Type, force: Boolean = false): Tree
+      def _asInstanceOf(t: Tree, tp: Type): Tree
       def _equals(checker: Tree, binder: Symbol): Tree
       def _isInstanceOf(b: Symbol, tp: Type): Tree
       def and(a: Tree, b: Tree): Tree
@@ -1248,6 +1445,24 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
 
     def typesConform(tp: Type, pt: Type) = ((tp eq pt) || (tp <:< pt))
 
+    // we use subtyping as a model for implication between instanceof tests
+    // i.e., when S <:< T we assume x.isInstanceOf[S] implies x.isInstanceOf[T]
+    // unfortunately this is not true in general:
+    // SI-6022 expects instanceOfTpImplies(ProductClass.tpe, AnyRefClass.tpe)
+    def instanceOfTpImplies(tp: Type, tpImplied: Type) = {
+      val tpValue    = tp.typeSymbol.isPrimitiveValueClass
+
+      // pretend we're comparing to Any when we're actually comparing to AnyVal or AnyRef
+      // (and the subtype is respectively a value type or not a value type)
+      // this allows us to reuse subtyping as a model for implication between instanceOf tests
+      // the latter don't see a difference between AnyRef, Object or Any when comparing non-value types -- SI-6022
+      val tpImpliedNormalizedToAny =
+        if (tpImplied =:= (if (tpValue) AnyValClass.tpe else AnyRefClass.tpe)) AnyClass.tpe
+        else tpImplied
+
+      tp <:< tpImpliedNormalizedToAny
+    }
+
     abstract class CommonCodegen extends AbsCodegen { import CODE._
       def fun(arg: Symbol, body: Tree): Tree           = Function(List(ValDef(arg)), body)
       def genTypeApply(tfun: Tree, args: Type*): Tree  = if(args contains NoType) tfun else TypeApply(tfun, args.toList map TypeTree)
@@ -1263,7 +1478,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         Typed(gen.mkAsInstanceOf(t, tp.withoutAnnotations, true, false), TypeTree() setType tp)
 
       // the force is needed mainly to deal with the GADT typing hack (we can't detect it otherwise as tp nor pt need contain an abstract type, we're just casting wildly)
-      def _asInstanceOf(t: Tree, tp: Type, force: Boolean = false): Tree = if (!force && (t.tpe ne NoType) && t.isTyped && typesConform(t.tpe, tp)) t else mkCast(t, tp)
+      def _asInstanceOf(t: Tree, tp: Type): Tree = if (t.tpe != NoType && t.isTyped && typesConform(t.tpe, tp)) t else mkCast(t, tp)
       def _asInstanceOf(b: Symbol, tp: Type): Tree = if (typesConform(b.info, tp)) REF(b) else mkCast(REF(b), tp)
       def _isInstanceOf(b: Symbol, tp: Type): Tree = gen.mkIsInstanceOf(REF(b), tp.withoutAnnotations, true, false)
       //   if (typesConform(b.info, tpX)) { patmatDebug("warning: emitted spurious isInstanceOf: "+(b, tp)); TRUE }
@@ -1428,9 +1643,9 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         case _ => false
       }
 
-      def unapply(xtm: ExtractorTreeMaker): Option[(Tree, Symbol, Substitution)] = xtm match {
-        case ExtractorTreeMaker(extractor, None, nextBinder, subst) if irrefutableExtractorType(extractor.tpe) =>
-          Some(extractor, nextBinder, subst)
+      def unapply(xtm: ExtractorTreeMaker): Option[(Tree, Symbol)] = xtm match {
+        case ExtractorTreeMaker(extractor, None, nextBinder) if irrefutableExtractorType(extractor.tpe) =>
+          Some(extractor, nextBinder)
         case _ =>
           None
       }
@@ -1438,18 +1653,13 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
 
     // returns (tree, tests), where `tree` will be used to refer to `root` in `tests`
     class TreeMakersToConds(val root: Symbol) {
-      def discard() = {
-        pointsToBound.clear()
-        trees.clear()
-        normalize  = EmptySubstitution
-        accumSubst = EmptySubstitution
-      }
       // a variable in this set should never be replaced by a tree that "does not consist of a selection on a variable in this set" (intuitively)
       private val pointsToBound = collection.mutable.HashSet(root)
       private val trees         = collection.mutable.HashSet.empty[Tree]
 
       // the substitution that renames variables to variables in pointsToBound
       private var normalize: Substitution  = EmptySubstitution
+      private var substitutionComputed = false
 
       // replaces a variable (in pointsToBound) by a selection on another variable in pointsToBound
       // in the end, instead of having x1, x1.hd, x2, x2.hd, ... flying around,
@@ -1458,29 +1668,6 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       // TODO check:
       //   pointsToBound -- accumSubst.from == Set(root) && (accumSubst.from.toSet -- pointsToBound) isEmpty
       private var accumSubst: Substitution = EmptySubstitution
-
-      private def updateSubstitution(subst: Substitution) = {
-        // find part of substitution that replaces bound symbols by new symbols, and reverse that part
-        // so that we don't introduce new aliases for existing symbols, thus keeping the set of bound symbols minimal
-        val (boundSubst, unboundSubst) = (subst.from zip subst.to) partition {
-          case (f, t) =>
-            t.isInstanceOf[Ident] && (t.symbol ne NoSymbol) && pointsToBound(f)
-        }
-        val (boundFrom, boundTo) = boundSubst.unzip
-        val (unboundFrom, unboundTo) = unboundSubst.unzip
-
-        // reverse substitution that would otherwise replace a variable we already encountered by a new variable
-        // NOTE: this forgets the more precise type we have for these later variables, but that's probably okay
-        normalize >>= Substitution(boundTo map (_.symbol), boundFrom map (CODE.REF(_)))
-        // patmatDebug ("normalize subst: "+ normalize)
-
-        val okSubst = Substitution(unboundFrom, unboundTo map (normalize(_))) // it's important substitution does not duplicate trees here -- it helps to keep hash consing simple, anyway
-        pointsToBound ++= ((okSubst.from, okSubst.to).zipped filter { (f, t) => pointsToBound exists (sym => t.exists(_.symbol == sym)) })._1
-        // patmatDebug ("pointsToBound: "+ pointsToBound)
-
-        accumSubst >>= okSubst
-        // patmatDebug ("accumSubst: "+ accumSubst)
-      }
 
       // hashconsing trees (modulo value-equality)
       def unique(t: Tree, tpOverride: Type = NoType): Tree =
@@ -1512,74 +1699,120 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
 
       // note that the sequencing of operations is important: must visit in same order as match execution
       // binderToUniqueTree uses the type of the first symbol that was encountered as the type for all future binders
-      final def treeMakerToCond(tm: TreeMaker, handleUnknown: TreeMaker => Cond, updateSubst: Boolean, rewriteNil: Boolean = false): Cond = {
-        if (updateSubst) updateSubstitution(tm.substitution)
+      abstract class TreeMakerToCond extends (TreeMaker => Cond) {
+        // requires(if (!substitutionComputed))
+        def updateSubstitution(subst: Substitution): Unit = {
+          // find part of substitution that replaces bound symbols by new symbols, and reverse that part
+          // so that we don't introduce new aliases for existing symbols, thus keeping the set of bound symbols minimal
+          val (boundSubst, unboundSubst) = (subst.from zip subst.to) partition {
+            case (f, t) =>
+              t.isInstanceOf[Ident] && (t.symbol ne NoSymbol) && pointsToBound(f)
+          }
+          val (boundFrom, boundTo) = boundSubst.unzip
+          val (unboundFrom, unboundTo) = unboundSubst.unzip
 
-        tm match {
-          case ttm@TypeTestTreeMaker(prevBinder, testedBinder, pt, _)   =>
-            object condStrategy extends TypeTestTreeMaker.TypeTestCondStrategy {
-              type Result                                           = Cond
-              def and(a: Result, b: Result)                         = AndCond(a, b)
-              def outerTest(testedBinder: Symbol, expectedTp: Type) = TrueCond // TODO OuterEqCond(testedBinder, expectedType)
-              def typeTest(b: Symbol, pt: Type) = { // a type test implies the tested path is non-null (null.isInstanceOf[T] is false for all T)
-                val p = binderToUniqueTree(b);                        AndCond(NonNullCond(p), TypeCond(p, uniqueTp(pt)))
+          // reverse substitution that would otherwise replace a variable we already encountered by a new variable
+          // NOTE: this forgets the more precise type we have for these later variables, but that's probably okay
+          normalize >>= Substitution(boundTo map (_.symbol), boundFrom map (CODE.REF(_)))
+          // patmatDebug ("normalize subst: "+ normalize)
+
+          val okSubst = Substitution(unboundFrom, unboundTo map (normalize(_))) // it's important substitution does not duplicate trees here -- it helps to keep hash consing simple, anyway
+          pointsToBound ++= ((okSubst.from, okSubst.to).zipped filter { (f, t) => pointsToBound exists (sym => t.exists(_.symbol == sym)) })._1
+          // patmatDebug("pointsToBound: "+ pointsToBound)
+
+          accumSubst >>= okSubst
+          // patmatDebug("accumSubst: "+ accumSubst)
+        }
+
+        def handleUnknown(tm: TreeMaker): Cond
+
+        /** apply itself must render a faithful representation of the TreeMaker
+         *
+         * Concretely, TrueCond must only be used to represent a TreeMaker that is sure to match and that does not do any computation at all
+         * e.g., doCSE relies on apply itself being sound in this sense (since it drops TreeMakers that are approximated to TrueCond -- SI-6077)
+         *
+         * handleUnknown may be customized by the caller to approximate further
+         *
+         * TODO: don't ignore outer-checks
+         */
+        def apply(tm: TreeMaker): Cond = {
+          if (!substitutionComputed) updateSubstitution(tm.subPatternsAsSubstitution)
+
+          tm match {
+            case ttm@TypeTestTreeMaker(prevBinder, testedBinder, pt, _)   =>
+              object condStrategy extends TypeTestTreeMaker.TypeTestCondStrategy {
+                type Result                                           = Cond
+                def and(a: Result, b: Result)                         = AndCond(a, b)
+                def outerTest(testedBinder: Symbol, expectedTp: Type) = TrueCond // TODO OuterEqCond(testedBinder, expectedType)
+                def typeTest(b: Symbol, pt: Type) = { // a type test implies the tested path is non-null (null.isInstanceOf[T] is false for all T)
+                  val p = binderToUniqueTree(b);                        AndCond(NonNullCond(p), TypeCond(p, uniqueTp(pt)))
+                }
+                def nonNullTest(testedBinder: Symbol)                 = NonNullCond(binderToUniqueTree(testedBinder))
+                def equalsTest(pat: Tree, testedBinder: Symbol)       = EqualityCond(binderToUniqueTree(testedBinder), unique(pat))
+                def eqTest(pat: Tree, testedBinder: Symbol)           = EqualityCond(binderToUniqueTree(testedBinder), unique(pat)) // TODO: eq, not ==
               }
-              def nonNullTest(testedBinder: Symbol)                 = NonNullCond(binderToUniqueTree(testedBinder))
-              def equalsTest(pat: Tree, testedBinder: Symbol)       = EqualityCond(binderToUniqueTree(testedBinder), unique(pat))
-              def eqTest(pat: Tree, testedBinder: Symbol)           = EqualityCond(binderToUniqueTree(testedBinder), unique(pat)) // TODO: eq, not ==
-            }
-            ttm.renderCondition(condStrategy)
-          case EqualityTestTreeMaker(prevBinder, patTree, _)        => EqualityCond(binderToUniqueTree(prevBinder), unique(patTree))
-          case AlternativesTreeMaker(_, altss, _)                   => \/(altss map (alts => /\(alts map (treeMakerToCond(_, handleUnknown, updateSubst)))))
-          case ProductExtractorTreeMaker(testedBinder, None, subst) => NonNullCond(binderToUniqueTree(testedBinder))
-          case IrrefutableExtractorTreeMaker(_, _, _)               =>
-            // the extra condition is None, the extractor's result indicates it always succeeds,
-            // and the potential type-test for the argument is represented by a separate TypeTestTreeMaker
-            TrueCond
-          case GuardTreeMaker(guard) =>
-            guard.tpe match {
-              case ConstantType(Constant(true))  => TrueCond
-              case ConstantType(Constant(false)) => FalseCond
-              case _                             => handleUnknown(tm)
-            }
-          case p @ ExtractorTreeMaker(extractor, Some(lenCheck), testedBinder, _) =>
-            p.checkedLength match {
-              // special-case: interpret pattern `List()` as `Nil`
-              // TODO: make it more general List(1, 2) => 1 :: 2 :: Nil  -- not sure this is a good idea...
-              case Some(0) if rewriteNil && testedBinder.tpe.typeSymbol == ListClass => // extractor.symbol.owner == SeqFactory
-                EqualityCond(binderToUniqueTree(p.prevBinder), unique(Ident(NilModule) setType NilModule.tpe))
-              case _ => handleUnknown(tm)
-            }
-          case SubstOnlyTreeMaker(_, _)                             => TrueCond
-          case ProductExtractorTreeMaker(_, Some(_), _) |
-               ExtractorTreeMaker(_, _, _, _) | BodyTreeMaker(_, _) => handleUnknown(tm)
+              ttm.renderCondition(condStrategy)
+            case EqualityTestTreeMaker(prevBinder, patTree, _)        => EqualityCond(binderToUniqueTree(prevBinder), unique(patTree))
+            case AlternativesTreeMaker(_, altss, _)                   => \/(altss map (alts => /\(alts map this)))
+            case ProductExtractorTreeMaker(testedBinder, None)        => NonNullCond(binderToUniqueTree(testedBinder))
+            case SubstOnlyTreeMaker(_, _)                             => TrueCond
+            case GuardTreeMaker(guard) =>
+              guard.tpe match {
+                case ConstantType(Constant(true))  => TrueCond
+                case ConstantType(Constant(false)) => FalseCond
+                case _                             => handleUnknown(tm)
+              }
+            case ExtractorTreeMaker(_, _, _) |
+                 ProductExtractorTreeMaker(_, _) |
+                 BodyTreeMaker(_, _)               => handleUnknown(tm)
+          }
         }
       }
 
-      val constFalse = (_: TreeMaker) => FalseCond
-      val constTrue  = (_: TreeMaker) => TrueCond
 
-      final def approximateMatch(cases: List[List[TreeMaker]], handleUnknown: TreeMaker => Cond = constFalse, rewriteNil: Boolean = false): List[List[Test]] =
-        cases.map { _ map (tm => Test(treeMakerToCond(tm, handleUnknown, updateSubst = true, rewriteNil), tm)) }
+      private val irrefutableExtractor: PartialFunction[TreeMaker, Cond] = {
+        // the extra condition is None, the extractor's result indicates it always succeeds,
+        // (the potential type-test for the argument is represented by a separate TypeTestTreeMaker)
+        case IrrefutableExtractorTreeMaker(_, _) => TrueCond
+      }
 
-      final def approximateMatchAgain(cases: List[List[TreeMaker]], handleUnknown: TreeMaker => Cond = constFalse, rewriteNil: Boolean = false): List[List[Test]] =
-        cases.map { _ map (tm => Test(treeMakerToCond(tm, handleUnknown, updateSubst = false, rewriteNil), tm)) }
+      // special-case: interpret pattern `List()` as `Nil`
+      // TODO: make it more general List(1, 2) => 1 :: 2 :: Nil  -- not sure this is a good idea...
+      private val rewriteListPattern: PartialFunction[TreeMaker, Cond] = {
+        case p @ ExtractorTreeMaker(_, _, testedBinder)
+          if testedBinder.tpe.typeSymbol == ListClass && p.checkedLength == Some(0) =>
+            EqualityCond(binderToUniqueTree(p.prevBinder), unique(Ident(NilModule) setType NilModule.tpe))
+      }
+      val fullRewrite      = (irrefutableExtractor orElse rewriteListPattern)
+      val refutableRewrite = irrefutableExtractor
+
+      @inline def onUnknown(handler: TreeMaker => Cond) = new TreeMakerToCond {
+        def handleUnknown(tm: TreeMaker) = handler(tm)
+      }
+
+      // used for CSE -- rewrite all unknowns to False (the most conserative option)
+      object conservative extends TreeMakerToCond {
+        def handleUnknown(tm: TreeMaker) = FalseCond
+      }
+
+      final def approximateMatch(cases: List[List[TreeMaker]], treeMakerToCond: TreeMakerToCond = conservative) ={
+        val testss = cases.map { _ map (tm => Test(treeMakerToCond(tm), tm)) }
+        substitutionComputed = true // a second call to approximateMatch should not re-compute the substitution (would be wrong)
+        testss
+      }
     }
 
-
-    def approximateMatch(root: Symbol, cases: List[List[TreeMaker]]): List[List[Test]] = {
-      object approximator extends TreeMakersToConds(root)
-      approximator.approximateMatch(cases)
-    }
+    def approximateMatchConservative(root: Symbol, cases: List[List[TreeMaker]]): List[List[Test]] =
+      (new TreeMakersToConds(root)).approximateMatch(cases)
 
     def showTreeMakers(cases: List[List[TreeMaker]]) = {
-      // patmatDebug ("treeMakers:")
-      // patmatDebug (alignAcrossRows(cases, ">>"))
+      patmatDebug("treeMakers:")
+      patmatDebug(alignAcrossRows(cases, ">>"))
     }
 
     def showTests(testss: List[List[Test]]) = {
-      // patmatDebug ("tests: ")
-      // patmatDebug (alignAcrossRows(testss, "&"))
+      patmatDebug("tests: ")
+      patmatDebug(alignAcrossRows(testss, "&"))
     }
   }
 
@@ -1614,20 +1847,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     class Prop
     case class Eq(p: Var, q: Const) extends Prop
 
-    type Const <: AbsConst
-    trait AbsConst {
-      // when we know V = C, which other equalities must hold
-      // in general, equality to some type implies equality to its supertypes
-      // (this multi-valued kind of equality is necessary for unreachability)
-      // note that we use subtyping as a model for implication between instanceof tests
-      // i.e., when S <:< T we assume x.isInstanceOf[S] implies x.isInstanceOf[T]
-      // unfortunately this is not true in general (see e.g. SI-6022)
-      def implies(other: Const): Boolean
-
-      // does V = C preclude V having value `other`?  V = null is an exclusive assignment,
-      // but V = 1 does not preclude V = Int, or V = Any
-      def excludes(other: Const): Boolean
-    }
+    type Const
 
     type TypeConst <: Const
     def TypeConst: TypeConstExtractor
@@ -1662,8 +1882,8 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       def propForEqualsTo(c: Const): Prop
 
       // populated by registerEquality
-      // once equalitySyms has been called, must not call registerEquality anymore
-      def equalitySyms: List[Sym]
+      // once implications has been called, must not call registerEquality anymore
+      def implications: List[(Sym, List[Sym], List[Sym])]
     }
 
     // would be nice to statically check whether a prop is equational or pure,
@@ -1734,7 +1954,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     // TODO: for V1 representing x1 and V2 standing for x1.head, encode that
     //       V1 = Nil implies -(V2 = Ci) for all Ci in V2's domain (i.e., it is unassignable)
     def removeVarEq(props: List[Prop], modelNull: Boolean = false): (Prop, List[Prop]) = {
-      val start = Statistics.startTimer(patmatAnaVarEq)
+      val start = if (Statistics.canEnable) Statistics.startTimer(patmatAnaVarEq) else null
 
       val vars = new collection.mutable.HashSet[Var]
 
@@ -1762,19 +1982,8 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       var eqAxioms: Prop = True
       @inline def addAxiom(p: Prop) = eqAxioms = And(eqAxioms, p)
 
-      case class ExcludedPair(a: Const, b: Const) {
-        override def equals(o: Any) = o match {
-          case ExcludedPair(aa, bb) => (a == aa && b == bb) || (a == bb && b == aa)
-          case _ => false
-        }
-        // make ExcludedPair(a, b).hashCode == ExcludedPair(b, a).hashCode
-        override def hashCode = a.hashCode ^ b.hashCode
-      }
-
-      // patmatDebug ("removeVarEq vars: "+ vars)
+      patmatDebug("removeVarEq vars: "+ vars)
       vars.foreach { v =>
-        val excludedPair = new collection.mutable.HashSet[ExcludedPair]
-
         // if v.domainSyms.isEmpty, we must consider the domain to be infinite
         // otherwise, since the domain fully partitions the type of the value,
         // exactly one of the types (and whatever it implies, imposed separately) must be chosen
@@ -1789,33 +1998,18 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
           else addAxiom(symForStaticTp)
         }
 
-        val syms = v.equalitySyms
-        // patmatDebug ("eqSyms "+(v, syms))
-        syms foreach { sym =>
-          // if we've already excluded the pair at some point (-A \/ -B), then don't exclude the symmetric one (-B \/ -A)
-          // (nor the positive implications -B \/ A, or -A \/ B, which would entail the equality axioms falsifying the whole formula)
-          val todo = syms filterNot (b => (b.const == sym.const) || excludedPair(ExcludedPair(b.const, sym.const)))
-          val (excluded, notExcluded) = todo partition (b => sym.const.excludes(b.const))
-          val implied = notExcluded filter (b => sym.const.implies(b.const))
-          // patmatDebug ("eq axioms for: "+ sym.const)
-          // patmatDebug ("excluded: "+ excluded)
-          // patmatDebug ("implied: "+ implied)
-
-          // when this symbol is true, what must hold...
-          implied  foreach (impliedSym => addAxiom(Or(Not(sym), impliedSym)))
-
+        v.implications foreach { case (sym, implied, excluded) =>
+          // when sym is true, what must hold...
+          implied  foreach (impliedSym  => addAxiom(Or(Not(sym), impliedSym)))
           // ... and what must not?
-          excluded foreach {excludedSym =>
-            excludedPair += ExcludedPair(sym.const, excludedSym.const)
-            addAxiom(Or(Not(sym), Not(excludedSym)))
-          }
+          excluded foreach (excludedSym => addAxiom(Or(Not(sym), Not(excludedSym))))
         }
       }
 
-      // patmatDebug ("eqAxioms:\n"+ cnfString(eqFreePropToSolvable(eqAxioms)))
-      // patmatDebug ("pure:"+ pure.map(p => cnfString(eqFreePropToSolvable(p))).mkString("\n"))
+      patmatDebug("eqAxioms:\n"+ cnfString(eqFreePropToSolvable(eqAxioms)))
+      patmatDebug("pure:"+ pure.map(p => cnfString(eqFreePropToSolvable(p))).mkString("\n"))
 
-      Statistics.stopTimer(patmatAnaVarEq, start)
+      if (Statistics.canEnable) Statistics.stopTimer(patmatAnaVarEq, start)
 
       (eqAxioms, pure)
     }
@@ -1824,14 +2018,14 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     type Formula
     def andFormula(a: Formula, b: Formula): Formula
 
-    class CNFBudgetExceeded extends RuntimeException("CNF budget exceeded")
 
-    // may throw an CNFBudgetExceeded
-    def propToSolvable(p: Prop) = {
+    // may throw an AnalysisBudget.Exception
+    def propToSolvable(p: Prop): Formula = {
       val (eqAxioms, pure :: Nil) = removeVarEq(List(p), modelNull = false)
       eqFreePropToSolvable(And(eqAxioms, pure))
     }
 
+    // may throw an AnalysisBudget.Exception
     def eqFreePropToSolvable(p: Prop): Formula
     def cnfString(f: Formula): String
 
@@ -1846,6 +2040,11 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
   trait CNF extends Logic {
     // CNF: a formula is a conjunction of clauses
     type Formula = Array[Clause]
+    /** Override Array creation for efficiency (to not go through reflection). */
+    private implicit val formulaTag: scala.reflect.ClassTag[Formula] = new scala.reflect.ClassTag[Formula] {
+      def runtimeClass: java.lang.Class[Formula] = classOf[Formula]
+      final override def newArray(len: Int): Array[Formula] = new Array[Formula](len)
+    }
     def formula(c: Clause*): Formula = c.toArray
     def andFormula(a: Formula, b: Formula): Formula = a ++ b
 
@@ -1857,31 +2056,39 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     type Lit
     def Lit(sym: Sym, pos: Boolean = true): Lit
 
-    // throws an CNFBudgetExceeded when the prop results in a CNF that's too big
+    // throws an AnalysisBudget.Exception when the prop results in a CNF that's too big
+    // TODO: be smarter/more efficient about this (http://lara.epfl.ch/w/sav09:tseitin_s_encoding)
     def eqFreePropToSolvable(p: Prop): Formula = {
-      // TODO: for now, reusing the normalization from DPLL
-      def negationNormalForm(p: Prop): Prop = p match {
-        case And(a, b)      => And(negationNormalForm(a), negationNormalForm(b))
-        case Or(a, b)       => Or(negationNormalForm(a), negationNormalForm(b))
-        case Not(And(a, b)) => negationNormalForm(Or(Not(a), Not(b)))
-        case Not(Or(a, b))  => negationNormalForm(And(Not(a), Not(b)))
-        case Not(Not(p))    => negationNormalForm(p)
-        case Not(True)      => False
-        case Not(False)     => True
-        case True
-           | False
-           | (_ : Sym)
-           | Not(_ : Sym)   => p
-      }
+      def negationNormalFormNot(p: Prop, budget: Int = AnalysisBudget.max): Prop =
+        if (budget <= 0) throw AnalysisBudget.exceeded
+        else p match {
+          case And(a, b) =>  Or(negationNormalFormNot(a, budget - 1), negationNormalFormNot(b, budget - 1))
+          case Or(a, b)  => And(negationNormalFormNot(a, budget - 1), negationNormalFormNot(b, budget - 1))
+          case Not(p)    => negationNormalForm(p, budget - 1)
+          case True      => False
+          case False     => True
+          case s: Sym    => Not(s)
+        }
+
+      def negationNormalForm(p: Prop, budget: Int = AnalysisBudget.max): Prop =
+        if (budget <= 0) throw AnalysisBudget.exceeded
+        else p match {
+          case And(a, b)      => And(negationNormalForm(a, budget - 1), negationNormalForm(b, budget - 1))
+          case Or(a, b)       =>  Or(negationNormalForm(a, budget - 1), negationNormalForm(b, budget - 1))
+          case Not(negated)   => negationNormalFormNot(negated, budget - 1)
+          case True
+             | False
+             | (_ : Sym)      => p
+        }
 
       val TrueF          = formula()
       val FalseF         = formula(clause())
       def lit(s: Sym)    = formula(clause(Lit(s)))
       def negLit(s: Sym) = formula(clause(Lit(s, false)))
 
-      def conjunctiveNormalForm(p: Prop, budget: Int = 256): Formula = {
+      def conjunctiveNormalForm(p: Prop, budget: Int = AnalysisBudget.max): Formula = {
         def distribute(a: Formula, b: Formula, budget: Int): Formula =
-          if (budget <= 0) throw new CNFBudgetExceeded
+          if (budget <= 0) throw AnalysisBudget.exceeded
           else
             (a, b) match {
               // true \/ _ = true
@@ -1896,7 +2103,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
                 big flatMap (c => distribute(formula(c), small, budget - (big.size*small.size)))
             }
 
-        if (budget <= 0) throw new CNFBudgetExceeded
+        if (budget <= 0) throw AnalysisBudget.exceeded
 
         p match {
           case True        => TrueF
@@ -1914,10 +2121,13 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         }
       }
 
-      val start = Statistics.startTimer(patmatCNF)
-      val res = conjunctiveNormalForm(negationNormalForm(p))
-      Statistics.stopTimer(patmatCNF, start)
-      patmatCNFSizes(res.size).value += 1
+      val start = if (Statistics.canEnable) Statistics.startTimer(patmatCNF) else null
+      val res   = conjunctiveNormalForm(negationNormalForm(p))
+
+      if (Statistics.canEnable) Statistics.stopTimer(patmatCNF, start)
+
+      //
+      if (Statistics.canEnable) patmatCNFSizes(res.size).value += 1
 
 //      patmatDebug("cnf for\n"+ p +"\nis:\n"+cnfString(res))
       res
@@ -1955,12 +2165,12 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       def findAllModels(f: Formula, models: List[Model], recursionDepthAllowed: Int = 10): List[Model]=
         if (recursionDepthAllowed == 0) models
         else {
-          // patmatDebug ("find all models for\n"+ cnfString(f))
+          patmatDebug("find all models for\n"+ cnfString(f))
           val model = findModelFor(f)
           // if we found a solution, conjunct the formula with the model's negation and recurse
           if (model ne NoModel) {
             val unassigned = (vars -- model.keySet).toList
-            // patmatDebug ("unassigned "+ unassigned +" in "+ model)
+            patmatDebug("unassigned "+ unassigned +" in "+ model)
             def force(lit: Lit) = {
               val model = withLit(findModelFor(dropUnit(f, lit)), lit)
               if (model ne NoModel) List(model)
@@ -1969,7 +2179,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
             val forced = unassigned flatMap { s =>
               force(Lit(s, true)) ++ force(Lit(s, false))
             }
-            // patmatDebug ("forced "+ forced)
+            patmatDebug("forced "+ forced)
             val negated = negateModel(model)
             findAllModels(f :+ negated, model :: (forced ++ models), recursionDepthAllowed - 1)
           }
@@ -1992,9 +2202,9 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     def findModelFor(f: Formula): Model = {
       @inline def orElse(a: Model, b: => Model) = if (a ne NoModel) a else b
 
-      // patmatDebug ("DPLL\n"+ cnfString(f))
+      patmatDebug("DPLL\n"+ cnfString(f))
 
-      val start = Statistics.startTimer(patmatAnaDPLL)
+      val start = if (Statistics.canEnable) Statistics.startTimer(patmatAnaDPLL) else null
 
       val satisfiableWithModel: Model =
         if (f isEmpty) EmptyModel
@@ -2032,7 +2242,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
             }
         }
 
-        Statistics.stopTimer(patmatAnaDPLL, start)
+        if (Statistics.canEnable) Statistics.stopTimer(patmatAnaDPLL, start)
 
         satisfiableWithModel
     }
@@ -2096,22 +2306,121 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         observed; allConsts
       }
 
-      // accessing after calling registerNull will result in inconsistencies
-      lazy val domainSyms: Option[Set[Sym]] = domain map { _ map symForEqualsTo }
-
-      lazy val symForStaticTp: Option[Sym]  = symForEqualsTo.get(TypeConst(staticTpCheckable))
-
       // populate equalitySyms
       // don't care about the result, but want only one fresh symbol per distinct constant c
       def registerEquality(c: Const): Unit = {ensureCanModify; symForEqualsTo getOrElseUpdate(c, Sym(this, c))}
-
-      // don't access until all potential equalities have been registered using registerEquality
-      lazy val equalitySyms = {observed; symForEqualsTo.values.toList}
 
       // return the symbol that represents this variable being equal to the constant `c`, if it exists, otherwise False (for robustness)
       // (registerEquality(c) must have been called prior, either when constructing the domain or from outside)
       def propForEqualsTo(c: Const): Prop = {observed; symForEqualsTo.getOrElse(c, False)}
 
+      // [implementation NOTE: don't access until all potential equalities have been registered using registerEquality]p
+      /** the information needed to construct the boolean proposition that encods the equality proposition (V = C)
+       *
+       * that models a type test pattern `_: C` or constant pattern `C`, where the type test gives rise to a TypeConst C,
+       * and the constant pattern yields a ValueConst C
+       *
+       * for exhaustivity, we really only need implication (e.g., V = 1 implies that V = 1 /\ V = Int, if both tests occur in the match,
+       * and thus in this variable's equality symbols), but reachability also requires us to model things like V = 1 precluding V = "1"
+       */
+      lazy val implications = {
+        /** when we know V = C, which other equalities must hold
+         *
+         * in general, equality to some type implies equality to its supertypes
+         * (this multi-valued kind of equality is necessary for unreachability)
+         * note that we use subtyping as a model for implication between instanceof tests
+         * i.e., when S <:< T we assume x.isInstanceOf[S] implies x.isInstanceOf[T]
+         * unfortunately this is not true in general (see e.g. SI-6022)
+         */
+        def implies(lower: Const, upper: Const): Boolean =
+          // values and null
+            lower == upper ||
+          // type implication
+            (lower != NullConst && !upper.isValue &&
+             instanceOfTpImplies(if (lower.isValue) lower.wideTp else lower.tp, upper.tp))
+
+          // if(r) patmatDebug("implies    : "+(lower, lower.tp, upper, upper.tp))
+          // else  patmatDebug("NOT implies: "+(lower, upper))
+
+
+        /** does V = C preclude V having value `other`?
+         (1) V = null is an exclusive assignment,
+         (2) V = A and V = B, for A and B value constants, are mutually exclusive unless A == B
+             we err on the safe side, for example:
+               - assume `val X = 1; val Y = 1`, then
+                 (2: Int) match { case X => case Y =>  <falsely considered reachable>  }
+               - V = 1 does not preclude V = Int, or V = Any, it could be said to preclude V = String, but we don't model that
+
+         (3) for types we could try to do something fancy, but be conservative and just say no
+         */
+        def excludes(a: Const, b: Const): Boolean =
+          a != b && ((a == NullConst || b == NullConst) || (a.isValue && b.isValue))
+
+          // if(r) patmatDebug("excludes    : "+(a, a.tp, b, b.tp))
+          // else  patmatDebug("NOT excludes: "+(a, b))
+
+/*
+[ HALF BAKED FANCINESS: //!equalitySyms.exists(common => implies(common.const, a) && implies(common.const, b)))
+ when type tests are involved, we reason (conservatively) under a closed world assumption,
+ since we are really only trying to counter the effects of the symbols that we introduce to model type tests
+ we don't aim to model the whole subtyping hierarchy, simply to encode enough about subtyping to do unreachability properly
+
+ consider the following hierarchy:
+
+    trait A
+    trait B
+    trait C
+    trait AB extends B with A
+
+  // two types are mutually exclusive if there is no equality symbol whose constant implies both
+  object Test extends App {
+    def foo(x: Any) = x match {
+      case _ : C  => println("C")
+      case _ : AB => println("AB")
+      case _ : (A with B) => println("AB'")
+      case _ : B  => println("B")
+      case _ : A  => println("A")
+    }
+
+ of course this kind of reasoning is not true in general,
+ but we can safely pretend types are mutually exclusive as long as there are no counter-examples in the match we're analyzing}
+*/
+
+        val excludedPair = new collection.mutable.HashSet[ExcludedPair]
+
+        case class ExcludedPair(a: Const, b: Const) {
+          override def equals(o: Any) = o match {
+            case ExcludedPair(aa, bb) => (a == aa && b == bb) || (a == bb && b == aa)
+            case _ => false
+          }
+          // make ExcludedPair(a, b).hashCode == ExcludedPair(b, a).hashCode
+          override def hashCode = a.hashCode ^ b.hashCode
+        }
+
+        equalitySyms map { sym =>
+          // if we've already excluded the pair at some point (-A \/ -B), then don't exclude the symmetric one (-B \/ -A)
+          // (nor the positive implications -B \/ A, or -A \/ B, which would entail the equality axioms falsifying the whole formula)
+          val todo = equalitySyms filterNot (b => (b.const == sym.const) || excludedPair(ExcludedPair(b.const, sym.const)))
+          val (excluded, notExcluded) = todo partition (b => excludes(sym.const, b.const))
+          val implied = notExcluded filter (b => implies(sym.const, b.const))
+
+          patmatDebug("eq axioms for: "+ sym.const)
+          patmatDebug("excluded: "+ excluded)
+          patmatDebug("implied: "+ implied)
+
+          excluded foreach { excludedSym => excludedPair += ExcludedPair(sym.const, excludedSym.const)}
+
+          (sym, implied, excluded)
+        }
+      }
+
+      // accessing after calling registerNull will result in inconsistencies
+      lazy val domainSyms: Option[Set[Sym]] = domain map { _ map symForEqualsTo }
+
+      lazy val symForStaticTp: Option[Sym]  = symForEqualsTo.get(TypeConst(staticTpCheckable))
+
+      // don't access until all potential equalities have been registered using registerEquality
+      private lazy val equalitySyms = {observed; symForEqualsTo.values.toList}
 
       // don't call until all equalities have been registered and registerNull has been called (if needed)
       def describe = toString + ": " + staticTp + domain.map(_.mkString(" ::= ", " | ", "// "+ symForEqualsTo.keys)).getOrElse(symForEqualsTo.keys.mkString(" ::= ", " | ", " | ...")) + " // = " + path
@@ -2136,11 +2445,11 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         uniques.get(tp).getOrElse(
           uniques.find {case (oldTp, oldC) => oldTp =:= tp} match {
             case Some((_, c)) =>
-              // patmatDebug ("unique const: "+ (tp, c))
+              patmatDebug("unique const: "+ (tp, c))
               c
             case _ =>
               val fresh = mkFresh
-              // patmatDebug ("uniqued const: "+ (tp, fresh))
+              patmatDebug("uniqued const: "+ (tp, fresh))
               uniques(tp) = fresh
               fresh
           })
@@ -2156,72 +2465,23 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         if (!t.symbol.isStable) t.tpe.narrow
         else trees find (a => a.correspondsStructure(t)(sameValue)) match {
           case Some(orig) =>
-            // patmatDebug ("unique tp for tree: "+ (orig, orig.tpe))
+            patmatDebug("unique tp for tree: "+ (orig, orig.tpe))
             orig.tpe
           case _ =>
             // duplicate, don't mutate old tree (TODO: use a map tree -> type instead?)
             val treeWithNarrowedType = t.duplicate setType t.tpe.narrow
-            // patmatDebug ("uniqued: "+ (t, t.tpe, treeWithNarrowedType.tpe))
+            patmatDebug("uniqued: "+ (t, t.tpe, treeWithNarrowedType.tpe))
             trees += treeWithNarrowedType
             treeWithNarrowedType.tpe
         }
     }
 
-    sealed abstract class Const extends AbsConst {
+    sealed abstract class Const {
       def tp: Type
-      protected def wideTp: Type
+      def wideTp: Type
 
       def isAny = wideTp.typeSymbol == AnyClass
-
-      // we use subtyping as a model for implication between instanceof tests
-      // i.e., when S <:< T we assume x.isInstanceOf[S] implies x.isInstanceOf[T]
-      // unfortunately this is not true in general:
-      // SI-6022 expects instanceOfTpImplies(ProductClass.tpe, AnyRefClass.tpe)
-      private def instanceOfTpImplies(tp: Type, tpImplied: Type) = {
-        val tpValue    = tp.typeSymbol.isPrimitiveValueClass
-
-        // pretend we're comparing to Any when we're actually comparing to AnyVal or AnyRef
-        // (and the subtype is respectively a value type or not a value type)
-        // this allows us to reuse subtyping as a model for implication between instanceOf tests
-        // the latter don't see a difference between AnyRef, Object or Any when comparing non-value types -- SI-6022
-        val tpImpliedNormalizedToAny =
-          if ((tpValue && tpImplied =:= AnyValClass.tpe) ||
-              (!tpValue && tpImplied =:= AnyRefClass.tpe)) AnyClass.tpe
-          else tpImplied
-
-        tp <:< tpImpliedNormalizedToAny
-      }
-
-      final def implies(other: Const): Boolean = {
-        val r = (this, other) match {
-          case (_: ValueConst, _: ValueConst) => this == other // hashconsed
-          case (_: ValueConst, _: TypeConst)  => instanceOfTpImplies(tp, other.tp)
-          case (_: TypeConst,  _)             => instanceOfTpImplies(tp, other.tp)
-          case _                              => false
-        }
-        // if(r) patmatDebug("implies    : "+(this, other))
-        // else  patmatDebug("NOT implies: "+(this, other))
-        r
-      }
-
-      // does V = C preclude V having value `other`?  V = null is an exclusive assignment,
-      // but V = 1 does not preclude V = Int, or V = Any
-      final def excludes(other: Const): Boolean = {
-        val r = (this, other) match {
-          case (_, NullConst)                 => true
-          case (NullConst, _)                 => true
-          // this causes false negative for unreachability, but that's ok:
-          // example: val X = 1; val Y = 1; (2: Int) match { case X => case Y => /* considered reachable */ }
-          case (_: ValueConst, _: ValueConst) => this != other
-          case (_: ValueConst, _: TypeConst)  => !(instanceOfTpImplies(tp, other.tp) || instanceOfTpImplies(other.tp, wideTp))
-          case (_: TypeConst,  _: ValueConst) => !(instanceOfTpImplies(other.tp, tp) || instanceOfTpImplies(tp, other.wideTp))
-          case (_: TypeConst,  _: TypeConst)  => !(instanceOfTpImplies(tp, other.tp) || instanceOfTpImplies(other.tp, tp))
-          case _                              => false
-        }
-        // if(r) patmatDebug("excludes    : "+(this, this.tp, other, other.tp))
-        // else  patmatDebug("NOT excludes: "+(this, other))
-        r
-      }
+      def isValue: Boolean //= tp.isStable
 
       // note: use reference equality on Const since they're hash-consed (doing type equality all the time is too expensive)
       // the equals inherited from AnyRef does just this
@@ -2233,15 +2493,9 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     // e.g., when we know some value must be of type T, can it still be of type S? (this is the positive formulation of what `excludes` on Const computes)
     // since we're talking values, there must have been a class involved in creating it, so rephrase our types in terms of classes
     // (At least conceptually: `true` is an instance of class `Boolean`)
-    private def widenToClass(tp: Type) = {
-      // getOrElse to err on the safe side -- all BTS should end in Any, right?
-      val wideTp = tp.widen
-      val clsTp =
-        if (wideTp.typeSymbol.isClass) wideTp
-        else wideTp.baseTypeSeq.toList.find(_.typeSymbol.isClass).getOrElse(AnyClass.tpe)
-      // patmatDebug("Widening to class: "+ (tp, clsTp, tp.widen, tp.widen.baseTypeSeq, tp.widen.baseTypeSeq.toList.find(_.typeSymbol.isClass)))
-      clsTp
-    }
+    private def widenToClass(tp: Type): Type =
+      if (tp.typeSymbol.isClass) tp
+      else tp.baseType(tp.baseClasses.head)
 
     object TypeConst extends TypeConstExtractor {
       def apply(tp: Type) = {
@@ -2258,7 +2512,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       private[this] val id: Int = Const.nextTypeId
 
       val wideTp = widenToClass(tp)
-
+      def isValue = false
       override def toString = tp.toString //+"#"+ id
     }
 
@@ -2302,14 +2556,15 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     }
     sealed class ValueConst(val tp: Type, val wideTp: Type, override val toString: String) extends Const {
       // patmatDebug("VC"+(tp, wideTp, toString))
-      assert(!(tp =:= NullTp))
+      assert(!(tp =:= NullTp)) // TODO: assert(!tp.isStable)
       private[this] val id: Int = Const.nextValueId
+      def isValue = true
     }
 
     lazy val NullTp = ConstantType(Constant(null))
     case object NullConst extends Const {
       def tp     = NullTp
-      protected def wideTp = NullTp
+      def wideTp = NullTp
 
       def isValue = true
       override def toString = "null"
@@ -2337,6 +2592,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     // right now hackily implement this by pruning counter-examples
     // unreachability would also benefit from a more faithful representation
 
+
     // reachability (dead code)
 
     // computes the first 0-based case index that is unreachable (if any)
@@ -2347,15 +2603,19 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     // thus, the case is unreachable if there is no model for -(-P /\ C),
     // or, equivalently, P \/ -C, or C => P
     def unreachableCase(prevBinder: Symbol, cases: List[List[TreeMaker]], pt: Type): Option[Int] = {
-      val start = Statistics.startTimer(patmatAnaReach)
+      val start = if (Statistics.canEnable) Statistics.startTimer(patmatAnaReach) else null
 
       // use the same approximator so we share variables,
       // but need different conditions depending on whether we're conservatively looking for failure or success
-      val reachabilityApproximation = new TreeMakersToConds(prevBinder)
-      val testCasesOk   = reachabilityApproximation.approximateMatch(cases, reachabilityApproximation.constTrue)
-      val testCasesFail = reachabilityApproximation.approximateMatchAgain(cases, reachabilityApproximation.constFalse)
+      // don't rewrite List-like patterns, as List() and Nil need to distinguished for unreachability
+      val approx = new TreeMakersToConds(prevBinder)
+      def approximate(default: Cond) = approx.approximateMatch(cases, approx.onUnknown { tm =>
+        approx.refutableRewrite.applyOrElse(tm, (_: TreeMaker) => default )
+      })
 
-      reachabilityApproximation.discard()
+      val testCasesOk   = approximate(TrueCond)
+      val testCasesFail = approximate(FalseCond)
+
       prepareNewAnalysis()
 
       val propsCasesOk   = testCasesOk   map (t => symbolicCase(t, modelNull = true))
@@ -2375,8 +2635,8 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         var reachable  = true
         var caseIndex  = 0
 
-        // patmatDebug ("reachability, vars:\n"+ ((propsCasesFail flatMap gatherVariables) map (_.describe) mkString ("\n")))
-        // patmatDebug ("equality axioms:\n"+ cnfString(eqAxiomsCNF))
+        patmatDebug("reachability, vars:\n"+ ((propsCasesFail flatMap gatherVariables).distinct map (_.describe) mkString ("\n")))
+        patmatDebug("equality axioms:\n"+ cnfString(eqAxiomsCNF))
 
         // invariant (prefixRest.length == current.length) && (prefix.reverse ++ prefixRest == symbolicCasesFail)
         // termination: prefixRest.length decreases by 1
@@ -2390,20 +2650,19 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
             current = current.tail
             val model = findModelFor(andFormula(eqFreePropToSolvable(current.head), prefix))
 
-  //          patmatDebug("trying to reach:\n"+ cnfString(current.head) +"\nunder prefix:\n"+ cnfString(prefix))
-  //          if (ok) patmatDebug("reached: "+ modelString(model))
+            // patmatDebug("trying to reach:\n"+ cnfString(eqFreePropToSolvable(current.head)) +"\nunder prefix:\n"+ cnfString(prefix))
+            // if (NoModel ne model) patmatDebug("reached: "+ modelString(model))
 
-            reachable = model ne NoModel
+            reachable = NoModel ne model
           }
         }
 
-        Statistics.stopTimer(patmatAnaReach, start)
+        if (Statistics.canEnable) Statistics.stopTimer(patmatAnaReach, start)
 
         if (reachable) None else Some(caseIndex)
       } catch {
-        case e : CNFBudgetExceeded =>
-//          debugWarn(util.Position.formatMessage(prevBinder.pos, "Cannot check match for reachability", false))
-//          e.printStackTrace()
+        case ex: AnalysisBudget.Exception =>
+          ex.warn(prevBinder.pos, "unreachability")
           None // CNF budget exceeded
       }
     }
@@ -2423,7 +2682,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
           Some(List(tp))
         // make sure it's not a primitive, else (5: Byte) match { case 5 => ... } sees no Byte
         case sym if !sym.isSealed || isPrimitiveValueClass(sym) =>
-          // patmatDebug ("enum unsealed "+ (tp, sym, sym.isSealed, isPrimitiveValueClass(sym)))
+          patmatDebug("enum unsealed "+ (tp, sym, sym.isSealed, isPrimitiveValueClass(sym)))
           None
         case sym =>
           val subclasses = (
@@ -2431,7 +2690,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
             // symbols which are both sealed and abstract need not be covered themselves, because
             // all of their children must be and they cannot otherwise be created.
             filterNot (x => x.isSealed && x.isAbstractClass && !isPrimitiveValueClass(x)))
-          // patmatDebug ("enum sealed -- subclasses: "+ (sym, subclasses))
+          patmatDebug("enum sealed -- subclasses: "+ (sym, subclasses))
 
           val tpApprox = typer.infer.approximateAbstracts(tp)
           val pre = tpApprox.prefix
@@ -2447,7 +2706,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
               if (subTpApprox <:< tpApprox) Some(checkableType(subTp))
               else None
             })
-          // patmatDebug ("enum sealed "+ (tp, tpApprox) + " as "+ validSubTypes)
+          patmatDebug("enum sealed "+ (tp, tpApprox) + " as "+ validSubTypes)
           Some(validSubTypes)
       }
 
@@ -2456,18 +2715,20 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
     // TODO: this is subject to the availability of TypeTags (since an abstract type with a type tag is checkable at run time)
     def checkableType(tp: Type): Type = {
       // TODO: this is extremely rough...
-      object toCheckable extends TypeMap {
-        def apply(tp: Type) = tp match {
-          case TypeRef(pre, sym, a :: as) if sym ne ArrayClass =>
-            // replace type args by existentials, since they can't be checked
-            // TODO: when type tags are available, we will check -- when this is implemented, can we take that into account here?
-            // TODO: don't reuse sym.typeParams, they have bounds (and those must not be considered)
-            newExistentialType(sym.typeParams, sym.tpe).asSeenFrom(pre, sym.owner)
-          case _ => mapOver(tp)
+      // replace type args by wildcards, since they can't be checked (don't use existentials: overkill)
+      // TODO: when type tags are available, we will check -- when this is implemented, can we take that into account here?
+      // similar to typer.infer.approximateAbstracts
+      object typeArgsToWildcardsExceptArray extends TypeMap {
+        def apply(tp: Type): Type = tp match {
+          case TypeRef(pre, sym, args) if args.nonEmpty && (sym ne ArrayClass) =>
+            TypeRef(pre, sym, args map (_ => WildcardType))
+          case _ =>
+            mapOver(tp)
         }
       }
-      val res = toCheckable(tp)
-      // patmatDebug ("checkable "+(tp, res))
+
+      val res = typeArgsToWildcardsExceptArray(tp)
+      patmatDebug("checkable "+(tp, res))
       res
     }
 
@@ -2489,22 +2750,22 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       // - back off (to avoid crying exhaustive too often) when:
       //    - there are guards -->
       //    - there are extractor calls (that we can't secretly/soundly) rewrite
-      val start = Statistics.startTimer(patmatAnaExhaust)
+      val start = if (Statistics.canEnable) Statistics.startTimer(patmatAnaExhaust) else null
       var backoff = false
 
-      val exhaustivityApproximation = new TreeMakersToConds(prevBinder)
-      val tests = exhaustivityApproximation.approximateMatch(cases, {
-          case BodyTreeMaker(_, _) => TrueCond // will be discarded by symbolCase later
-          case tm =>
-            // patmatDebug("backing off due to "+ tm)
+      val approx = new TreeMakersToConds(prevBinder)
+      val tests = approx.approximateMatch(cases, approx.onUnknown { tm =>
+        approx.fullRewrite.applyOrElse[TreeMaker, Cond](tm, {
+          case BodyTreeMaker(_, _) => TrueCond // irrelevant -- will be discarded by symbolCase later
+          case _ => // patmatDebug("backing off due to "+ tm)
             backoff = true
             FalseCond
-        }, rewriteNil = true)
+        })
+      })
 
       if (backoff) Nil else {
-        val prevBinderTree = exhaustivityApproximation.binderToUniqueTree(prevBinder)
+        val prevBinderTree = approx.binderToUniqueTree(prevBinder)
 
-        exhaustivityApproximation.discard()
         prepareNewAnalysis()
 
         val symbolicCases = tests map (symbolicCase(_, modelNull = false))
@@ -2525,7 +2786,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         val vars = gatherVariables(matchFails)
 
   // debug output:
-        // patmatDebug ("analysing:")
+        patmatDebug("analysing:")
         showTreeMakers(cases)
         showTests(tests)
 
@@ -2541,12 +2802,11 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
 
           val pruned = CounterExample.prune(counterExamples).map(_.toString).sorted
 
-          Statistics.stopTimer(patmatAnaExhaust, start)
+          if (Statistics.canEnable) Statistics.stopTimer(patmatAnaExhaust, start)
           pruned
         } catch {
-          case e : CNFBudgetExceeded =>
-            // patmatDebug (util.Position.formatMessage(prevBinder.pos, "Cannot check match for exhaustivity", false))
-            // e.printStackTrace()
+          case ex : AnalysisBudget.Exception =>
+            ex.warn(prevBinder.pos, "exhaustivity")
             Nil // CNF budget exceeded
         }
       }
@@ -2635,7 +2895,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       // ...
       val varAssignment = modelToVarAssignment(model)
 
-      // patmatDebug ("var assignment for model "+ model +":\n"+ varAssignmentString(varAssignment))
+      patmatDebug("var assignment for model "+ model +":\n"+ varAssignmentString(varAssignment))
 
       // chop a path into a list of symbols
       def chop(path: Tree): List[Symbol] = path match {
@@ -2683,7 +2943,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       // node in the tree that describes how to construct a counter-example
       case class VariableAssignment(variable: Var, equalTo: List[Const], notEqualTo: List[Const], fields: collection.mutable.Map[Symbol, VariableAssignment]) {
         // need to prune since the model now incorporates all super types of a constant (needed for reachability)
-        private lazy val uniqueEqualTo = equalTo filterNot (subsumed => equalTo.exists(better => (better ne subsumed) && (better implies subsumed)))
+        private lazy val uniqueEqualTo = equalTo filterNot (subsumed => equalTo.exists(better => (better ne subsumed) && instanceOfTpImplies(better.tp, subsumed.tp)))
         private lazy val prunedEqualTo = uniqueEqualTo filterNot (subsumed => variable.staticTpCheckable <:< subsumed.tp)
         private lazy val ctor       = (prunedEqualTo match { case List(TypeConst(tp)) => tp case _ => variable.staticTpCheckable }).typeSymbol.primaryConstructor
         private lazy val ctorParams = if (ctor == NoSymbol || ctor.paramss.isEmpty) Nil else ctor.paramss.head
@@ -2702,7 +2962,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         def toCounterExample(beBrief: Boolean = false): CounterExample =
           if (!allFieldAssignmentsLegal) NoExample
           else {
-            // patmatDebug ("describing "+ (variable, equalTo, notEqualTo, fields, cls, allFieldAssignmentsLegal))
+            patmatDebug("describing "+ (variable, equalTo, notEqualTo, fields, cls, allFieldAssignmentsLegal))
             val res = prunedEqualTo match {
               // a definite assignment to a value
               case List(eq: ValueConst) if fields.isEmpty => ValueExample(eq)
@@ -2743,7 +3003,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
               // TODO: improve reasoning -- in the mean time, a false negative is better than an annoying false positive
               case _ => NoExample
             }
-            // patmatDebug ("described as: "+ res)
+            patmatDebug("described as: "+ res)
             res
           }
 
@@ -2768,7 +3028,10 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
      * we generalize sharing to implication, where b reuses a if a => b and priors(a) => priors(b) (the priors of a sub expression form the path through the decision tree)
      */
     def doCSE(prevBinder: Symbol, cases: List[List[TreeMaker]], pt: Type): List[List[TreeMaker]] = {
-      val testss = approximateMatch(prevBinder, cases)
+      patmatDebug("before CSE:")
+      showTreeMakers(cases)
+
+      val testss = approximateMatchConservative(prevBinder, cases)
 
       // interpret:
       val dependencies = new collection.mutable.LinkedHashMap[Test, Set[Cond]]
@@ -2778,10 +3041,10 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         val cond = test.cond
 
         def simplify(c: Cond): Set[Cond] = c match {
-          case AndCond(a, b)  => simplify(a) ++ simplify(b)
+          case AndCond(a, b) => simplify(a) ++ simplify(b)
           case OrCond(_, _)   => Set(FalseCond) // TODO: make more precise
           case NonNullCond(_) => Set(TrueCond)  // not worth remembering
-          case _              => Set(c)
+          case _ => Set(c)
         }
         val conds = simplify(cond)
 
@@ -2796,7 +3059,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
               case (priorTest, deps) =>
                 ((simplify(priorTest.cond) == nonTrivial) || // our conditions are implied by priorTest if it checks the same thing directly
                  (nonTrivial subsetOf deps)                  // or if it depends on a superset of our conditions
-                ) && (deps subsetOf tested)                  // the conditions we've tested when we are here in the match satisfy the prior test, and hence what it tested
+                ) && (deps subsetOf tested)                 // the conditions we've tested when we are here in the match satisfy the prior test, and hence what it tested
             } foreach {
               case (priorTest, _) =>
                 // if so, note the dependency in both tests
@@ -2814,7 +3077,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         tested.clear()
         tests dropWhile storeDependencies
       }
-      // patmatDebug ("dependencies: "+ dependencies)
+      patmatDebug("dependencies: "+ dependencies)
 
       // find longest prefix of tests that reuse a prior test, and whose dependent conditions monotonically increase
       // then, collapse these contiguous sequences of reusing tests
@@ -2848,7 +3111,8 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
               case _ =>
             }
 
-            // patmatDebug("sharedPrefix: "+ sharedPrefix)
+            patmatDebug("sharedPrefix: "+ sharedPrefix)
+            patmatDebug("suffix: "+ sharedPrefix)
             // if the shared prefix contains interesting conditions (!= TrueCond)
             // and the last of such interesting shared conditions reuses another treemaker's test
             // replace the whole sharedPrefix by a ReusingCondTreeMaker
@@ -2864,7 +3128,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       // replace original treemakers that are reused (as determined when computing collapsed),
       // by ReusedCondTreeMakers
       val reusedMakers = collapsed mapConserve (_ mapConserve reusedOrOrig)
-      // patmatDebug ("after CSE:")
+      patmatDebug("after CSE:")
       showTreeMakers(reusedMakers)
       reusedMakers
     }
@@ -2942,6 +3206,8 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
 
   //// SWITCHES -- TODO: operate on Tests rather than TreeMakers
   trait SwitchEmission extends TreeMakers with OptimizedMatchMonadInterface { self: CodegenCore =>
+    import treeInfo.isGuardedCase
+
     abstract class SwitchMaker {
       abstract class SwitchableTreeMakerExtractor { def unapply(x: TreeMaker): Option[Tree] }
       val SwitchableTreeMaker: SwitchableTreeMakerExtractor
@@ -2974,95 +3240,174 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
           }
       }
 
-      private val defaultLabel: Symbol =  NoSymbol.newLabel(freshName("default"), NoPosition) setFlag SYNTH_CASE
+      private val defaultLabel: Symbol =  newSynthCaseLabel("default")
 
       /** Collapse guarded cases that switch on the same constant (the last case may be unguarded).
        *
-       * `{case C if(G_i) => B_i | case C'_j if G'_j => B'_j}*`  is rewritten to
-       * `case C => {if(G_i) B_i}*` ++ rewrite({case C'_j if G'_j => B'_j}*)
+       * Cases with patterns A and B switch on the same constant iff for all values x that match A also match B and vice versa.
+       * (This roughly corresponds to equality on trees modulo alpha renaming and reordering of alternatives.)
        *
+       * The rewrite only applies if some of the cases are guarded (this must be checked before invoking this method).
+       *
+       * The rewrite goes through the switch top-down and merges each case with the subsequent cases it is implied by
+       * (i.e. it matches if they match, not taking guards into account)
+       *
+       * If there are no unreachable cases, all cases can be uniquely assigned to a partition of such 'overlapping' cases,
+       * save for the default case (thus we jump to it rather than copying it several times).
+       * (The cases in a partition are implied by the principal element of the partition.)
+       *
+       * The overlapping cases are merged into one case with their guards pushed into the body as follows
+       * (with P the principal element of the overlapping patterns Pi):
+       *
+       *    `{case Pi if(G_i) => B_i }*` is rewritten to `case P => {if(G_i) B_i}*`
+       *
+       * The rewrite fails (and returns Nil) when:
+       *   (1) there is a subsequence of overlapping cases that has an unguarded case in the middle;
+       *       only the last case of each subsequence of overlapping cases may be unguarded (this is implied by unreachability)
+       *
+       *   (2) there are overlapping cases that differ (tested by `caseImpliedBy`)
+       *       cases with patterns A and B are overlapping if for SOME value x, A matches x implies B matches y OR vice versa  <-- note the difference with case equality defined above
+       *       for example `case 'a' | 'b' =>` and `case 'b' =>` are different and overlapping (overlapping and equality disregard guards)
+       *
+       * The second component of the returned tuple indicates whether we'll need to emit a labeldef to jump to the default case.
        */
-      private def collapseGuardedCases(cases: List[CaseDef]) = {
-        // requires(switchesOnSameConst.forall(caseChecksSameConst(switchesOnSameConst.head)))
-        def collapse(switchesOnSameConst: List[CaseDef]): List[CaseDef] =
-          if (switchesOnSameConst.tail.isEmpty && (switchesOnSameConst.head.guard == EmptyTree)) switchesOnSameConst
-          else {
-            val commonPattern = switchesOnSameConst.head.pat
+      private def collapseGuardedCases(cases: List[CaseDef]): (List[CaseDef], Boolean) = {
+        // requires(same.forall(caseEquals(same.head)))
+        // requires(same.nonEmpty, same)
+        def collapse(same: List[CaseDef], isDefault: Boolean): CaseDef = {
+          val commonPattern = same.head.pat
+          // jump to default case (either the user-supplied one or the synthetic one)
+          // unless we're collapsing the default case: then we re-use the same body as the synthetic catchall (throwing a matcherror, rethrowing the exception)
+          val jumpToDefault: Tree =
+            if (isDefault || !canJump) defaultBody
+            else Apply(Ident(defaultLabel), Nil)
 
-            // jump to default case (either the user-supplied one or the synthetic one)
-            // unless we're collapsing the default case, then re-use the same body as the synthetic catchall (throwing a matcherror, rethrowing the exception)
-            val jumpToDefault: Tree =
-              if (!canJump || isDefault(CaseDef(commonPattern, EmptyTree, EmptyTree))) defaultBody
-              else Apply(Ident(defaultLabel), Nil)
+          val guardedBody = same.foldRight(jumpToDefault){
+            // the last case may be un-guarded (we know it's the last one since fold's accum == jumpToDefault)
+            // --> replace jumpToDefault by the un-guarded case's body
+            case (CaseDef(_, EmptyTree, b), `jumpToDefault`)     => b
+            case (cd@CaseDef(_, g, b), els) if isGuardedCase(cd) => If(g, b, els)
+          }
 
-            val guardedBody = switchesOnSameConst.foldRight(jumpToDefault){
-              // the last case may be un-guarded (we know it's the last one since fold's accum == jumpToDefault)
-              // --> replace jumpToDefault by the un-guarded case's body
-              case (CaseDef(_, EmptyTree, b), `jumpToDefault`)  => b
-              case (CaseDef(_, g, b), els) if g != EmptyTree => If(g, b, els)
-              // error: the un-guarded case did not come last
-              case _ =>
-                return switchesOnSameConst
+          // if the cases that we're going to collapse bind variables,
+          // must replace them by the single binder introduced by the collapsed case
+          val binders = same.collect{case CaseDef(x@Bind(_, _), _, _) if x.symbol != NoSymbol => x.symbol}
+          val (pat, guardedBodySubst) =
+            if (binders.isEmpty) (commonPattern, guardedBody)
+            else {
+              // create a single fresh binder to subsume the old binders (and their types)
+              // TODO: I don't think the binder's types can actually be different (due to checks in caseEquals)
+              // if they do somehow manage to diverge, the lub might not be precise enough and we could get a type error
+              // TODO: reuse name exactly if there's only one binder in binders
+              val binder = freshSym(binders.head.pos, lub(binders.map(_.tpe)), binders.head.name.toString)
+
+              // the patterns in same are equal (according to caseEquals)
+              // we can thus safely pick the first one arbitrarily, provided we correct binding
+              val origPatWithoutBind = commonPattern match {
+                case Bind(b, orig) => orig
+                case o => o
+              }
+              // need to replace `defaultSym` as well -- it's used in `defaultBody` (see `jumpToDefault` above)
+              val unifiedBody = guardedBody.substituteSymbols(defaultSym :: binders, binder :: binders.map(_ => binder))
+              (Bind(binder, origPatWithoutBind), unifiedBody)
             }
 
-            // if the cases that we're going to collapse bind variables,
-            // must replace them by the single binder introduced by the collapsed case
-            val binders = switchesOnSameConst.collect{case CaseDef(x@Bind(_, _), _, _) if x.symbol != NoSymbol => x.symbol}
-            val (pat, guardedBodySubst) =
-              if (binders.isEmpty) (commonPattern, guardedBody)
-              else {
-                // create a single fresh binder to subsume the old binders (and their types)
-                // TODO: I don't think the binder's types can actually be different (due to checks in caseChecksSameConst)
-                // if they do somehow manage to diverge, the lub might not be precise enough and we could get a type error
-                val binder = freshSym(binders.head.pos, lub(binders.map(_.tpe)))
+          atPos(commonPattern.pos)(CaseDef(pat, EmptyTree, guardedBodySubst))
+        }
 
-                // the patterns in switchesOnSameConst are equal (according to caseChecksSameConst) and modulo variable-binding
-                // we can thus safely pick the first one arbitrarily, provided we correct binding
-                val origPatWithoutBind = commonPattern match {
-                  case Bind(b, orig) => orig
-                  case o => o
-                }
-                // need to replace `defaultSym` as well -- it's used in `defaultBody` (see `jumpToDefault` above)
-                val unifiedBody = guardedBody.substituteSymbols(defaultSym :: binders, binder :: binders.map(_ => binder))
-                (Bind(binder, origPatWithoutBind), unifiedBody)
-              }
+        // requires cases.exists(isGuardedCase) (otherwise the rewrite is pointless)
+        var remainingCases = cases
+        val collapsed      = collection.mutable.ListBuffer.empty[CaseDef]
 
-            List(CaseDef(pat, EmptyTree, guardedBodySubst))
+        // when some of collapsed cases (except for the default case itself) did not include an un-guarded case
+        // we'll need to emit a labeldef for the default case
+        var needDefault  = false
+
+        while (remainingCases.nonEmpty) {
+          val currCase              = remainingCases.head
+          val currIsDefault         = isDefault(CaseDef(currCase.pat, EmptyTree, EmptyTree))
+          val (impliesCurr, others) =
+            // the default case is implied by all cases, no need to partition (and remainingCases better all be default cases as well)
+            if (currIsDefault) (remainingCases.tail, Nil)
+            else remainingCases.tail partition (caseImplies(currCase))
+
+          val unguardedComesLastOrAbsent =
+            (!isGuardedCase(currCase) && impliesCurr.isEmpty) || { val LastImpliesCurr = impliesCurr.length - 1
+            impliesCurr.indexWhere(oc => !isGuardedCase(oc)) match {
+              // if all cases are guarded we will have to jump to the default case in the final else
+              // (except if we're collapsing the default case itself)
+              case -1 =>
+                if (!currIsDefault) needDefault = true
+                true
+
+              // last case is not guarded, no need to jump to the default here
+              // note: must come after case -1 => (since LastImpliesCurr may be -1)
+              case LastImpliesCurr => true
+
+              case _ => false
+            }}
+
+          if (unguardedComesLastOrAbsent /*(1)*/ && impliesCurr.forall(caseEquals(currCase)) /*(2)*/) {
+            collapsed += (
+              if (impliesCurr.isEmpty && !isGuardedCase(currCase)) currCase
+              else collapse(currCase :: impliesCurr, currIsDefault)
+            )
+
+            remainingCases = others
+          } else { // fail
+            collapsed.clear()
+            remainingCases = Nil
           }
+        }
 
-        @annotation.tailrec def partitionAndCollapse(cases: List[CaseDef], accum: List[CaseDef] = Nil): List[CaseDef] =
-          if (cases.isEmpty) accum
-          else {
-            val (same, others) = cases.tail partition (caseChecksSameConst(cases.head))
-            partitionAndCollapse(others, accum ++ collapse(cases.head :: same))
-          }
-
-        // common case: no rewrite needed when there are no guards
-        if (cases.forall(c => c.guard == EmptyTree)) cases
-        else partitionAndCollapse(cases)
+        (collapsed.toList, needDefault)
       }
 
-      private def caseChecksSameConst(x: CaseDef)(y: CaseDef) = (x, y) match {
+      private def caseEquals(x: CaseDef)(y: CaseDef) = patternEquals(x.pat)(y.pat)
+      private def patternEquals(x: Tree)(y: Tree): Boolean = (x, y) match {
+        case (Alternative(xs), Alternative(ys)) =>
+          xs.forall(x => ys.exists(patternEquals(x))) &&
+          ys.forall(y => xs.exists(patternEquals(y)))
+        case (Alternative(pats), _) => pats.forall(p => patternEquals(p)(y))
+        case (_, Alternative(pats)) => pats.forall(q => patternEquals(x)(q))
         // regular switch
-        case (CaseDef(Literal(Constant(cx)), _, _), CaseDef(Literal(Constant(cy)), _, _)) => cx == cy
-        case (CaseDef(Ident(nme.WILDCARD), _, _), CaseDef(Ident(nme.WILDCARD), _, _)) => true
+        case (Literal(Constant(cx)), Literal(Constant(cy))) => cx == cy
+        case (Ident(nme.WILDCARD), Ident(nme.WILDCARD))     => true
         // type-switch for catch
-        case (CaseDef(Bind(_, Typed(Ident(nme.WILDCARD), tpX)), _, _), CaseDef(Bind(_, Typed(Ident(nme.WILDCARD), tpY)), _, _)) => tpX.tpe =:= tpY.tpe
+        case (Bind(_, Typed(Ident(nme.WILDCARD), tpX)), Bind(_, Typed(Ident(nme.WILDCARD), tpY))) => tpX.tpe =:= tpY.tpe
         case _ => false
       }
 
-      private def checkNoGuards(cs: List[CaseDef]) =
-        if (cs.exists{case CaseDef(_, g, _) => g != EmptyTree case _ => false}) None
-        else Some(cs)
+      // if y matches then x matches for sure (thus, if x comes before y, y is unreachable)
+      private def caseImplies(x: CaseDef)(y: CaseDef) = patternImplies(x.pat)(y.pat)
+      private def patternImplies(x: Tree)(y: Tree): Boolean = (x, y) match {
+        // since alternatives are flattened, must treat them as separate cases
+        case (Alternative(pats), _) => pats.exists(p => patternImplies(p)(y))
+        case (_, Alternative(pats)) => pats.exists(q => patternImplies(x)(q))
+        // regular switch
+        case (Literal(Constant(cx)), Literal(Constant(cy))) => cx == cy
+        case (Ident(nme.WILDCARD), _)                       => true
+        // type-switch for catch
+        case (Bind(_, Typed(Ident(nme.WILDCARD), tpX)),
+              Bind(_, Typed(Ident(nme.WILDCARD), tpY)))     => instanceOfTpImplies(tpY.tpe, tpX.tpe)
+        case _ => false
+      }
 
-      // requires(cs.forall(_.guard == EmptyTree))
+      private def noGuards(cs: List[CaseDef]): Boolean = !cs.exists(isGuardedCase)
+
+      // must do this before removing guards from cases and collapsing (SI-6011, SI-6048)
       private def unreachableCase(cs: List[CaseDef]): Option[CaseDef] = {
         var cases = cs
         var unreachable: Option[CaseDef] = None
 
         while (cases.nonEmpty && unreachable.isEmpty) {
-          if (isDefault(cases.head) && cases.tail.nonEmpty) unreachable = Some(cases.tail.head)
-          else unreachable = cases.tail.find(caseChecksSameConst(cases.head))
+          val currCase = cases.head
+          if (isDefault(currCase) && cases.tail.nonEmpty) // subsumed by the `else if` that follows, but faster
+            unreachable = Some(cases.tail.head)
+          else if (!isGuardedCase(currCase) || currCase.guard.tpe =:= ConstantType(Constant(true)))
+            unreachable = cases.tail.find(caseImplies(currCase))
+          else if (currCase.guard.tpe =:= ConstantType(Constant(false)))
+            unreachable = Some(currCase)
 
           cases = cases.tail
         }
@@ -3071,68 +3416,76 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
       }
 
       // empty list ==> failure
-      def apply(cases: List[(Symbol, List[TreeMaker])], pt: Type): List[CaseDef] = {
-        val caseDefs = cases map { case (scrutSym, makers) =>
-          makers match {
-            // default case
-            case GuardAndBodyTreeMakers(guard, body) =>
-              Some(defaultCase(scrutSym, guard, body))
-            // constant (or typetest for typeSwitch)
-            case SwitchableTreeMaker(pattern) :: GuardAndBodyTreeMakers(guard, body) =>
-              Some(CaseDef(pattern, guard, body))
-            // alternatives
-            case AlternativesTreeMaker(_, altss, _) :: GuardAndBodyTreeMakers(guard, body) if alternativesSupported =>
-              val switchableAlts = altss map {
-                case SwitchableTreeMaker(pattern) :: Nil =>
-                  Some(pattern)
-                case _ =>
-                  None
-              }
+      def apply(cases: List[(Symbol, List[TreeMaker])], pt: Type): List[CaseDef] =
+        // generate if-then-else for 1 case switch (avoids verify error... can't imagine a one-case switch being faster than if-then-else anyway)
+        if (cases.isEmpty || cases.tail.isEmpty) Nil
+        else {
+          val caseDefs = cases map { case (scrutSym, makers) =>
+            makers match {
+              // default case
+              case GuardAndBodyTreeMakers(guard, body) =>
+                Some(defaultCase(scrutSym, guard, body))
+              // constant (or typetest for typeSwitch)
+              case SwitchableTreeMaker(pattern) :: GuardAndBodyTreeMakers(guard, body) =>
+                Some(CaseDef(pattern, guard, body))
+              // alternatives
+              case AlternativesTreeMaker(_, altss, _) :: GuardAndBodyTreeMakers(guard, body) if alternativesSupported =>
+                val switchableAlts = altss map {
+                  case SwitchableTreeMaker(pattern) :: Nil =>
+                    Some(pattern)
+                  case _ =>
+                    None
+                }
 
-              // succeed if they were all switchable
-              sequence(switchableAlts) map { switchableAlts =>
-                CaseDef(Alternative(switchableAlts), guard, body)
-              }
-            case _ =>
-              // patmatDebug("can't emit switch for "+ makers)
-              None //failure (can't translate pattern to a switch)
-          }
-        }
-
-        (for(
-          caseDefsWithGuards <- sequence(caseDefs);
-          collapsed = collapseGuardedCases(caseDefsWithGuards);
-          caseDefs <- checkNoGuards(collapsed)) yield {
-            if (!unchecked)
-              unreachableCase(caseDefs) foreach (cd => reportUnreachable(cd.body.pos))
-
-            // if we rewrote, we may need the default label to jump there (but then again, we may not)
-            // TODO: make more precise; we don't need the default label if
-            //  - all collapsed cases included an un-guarded case (some of the guards of each case will always be true)
-            //  - or: there was no default case (if all the guards of a case fail, it's a matcherror for sure)
-            val needDefaultLabel = (collapsed != caseDefsWithGuards)
-
-            def wrapInDefaultLabelDef(cd: CaseDef): CaseDef =
-              if (needDefaultLabel && canJump) deriveCaseDef(cd){ b =>
-                // TODO: can b.tpe ever be null? can't really use pt, see e.g. pos/t2683 or cps/match1.scala
-                defaultLabel setInfo MethodType(Nil, if (b.tpe != null) b.tpe else pt)
-                LabelDef(defaultLabel, Nil, b)
-              } else cd
-
-            (caseDefs partition isDefault) match {
-              case (Nil, caseDefs) => caseDefs :+ wrapInDefaultLabelDef(defaultCase())
-              case (default :: Nil, caseDefs) if canJump || !needDefaultLabel =>
-                // we either didn't collapse (and thus definitely didn't have to emit a jump),
-                // or we canJump (and then the potential jumps in collapsed are ok)
-                caseDefs :+ wrapInDefaultLabelDef(default)
-              case _ => Nil
-                // TODO: if (canJump) error message (but multiple defaults should be caught by unreachability)
-                // if (!canJump) we got ourselves in the situation where we might need to emit a jump when we can't (in exception handler)
-                //  --> TODO: refine the condition to detect whether we actually really needed to jump, but this seems relatively rare
+                // succeed if they were all switchable
+                sequence(switchableAlts) map { switchableAlts =>
+                  CaseDef(Alternative(switchableAlts), guard, body)
+                }
+              case _ =>
+                // patmatDebug("can't emit switch for "+ makers)
+                None //failure (can't translate pattern to a switch)
             }
           }
-        ) getOrElse Nil
-      }
+
+          val caseDefsWithGuards = sequence(caseDefs) match {
+            case None      => return Nil
+            case Some(cds) => cds
+          }
+
+          val allReachable = unchecked || {
+            // a switch with duplicate cases yields a verify error,
+            // and a switch with duplicate cases and guards cannot soundly be rewritten to an unguarded switch
+            // (even though the verify error would disappear, the behaviour would change)
+            unreachableCase(caseDefsWithGuards) map (cd => reportUnreachable(cd.body.pos)) isEmpty
+          }
+
+          if (!allReachable) Nil
+          else if (noGuards(caseDefsWithGuards)) {
+            if (isDefault(caseDefsWithGuards.last)) caseDefsWithGuards
+            else caseDefsWithGuards :+ defaultCase()
+          } else {
+            // collapse identical cases with different guards, push guards into body for all guarded cases
+            // this translation is only sound if there are no unreachable (duplicate) cases
+            // it should only be run if there are guarded cases, and on failure it returns Nil
+            val (collapsed, needDefaultLabel) = collapseGuardedCases(caseDefsWithGuards)
+
+            if (collapsed.isEmpty || (needDefaultLabel && !canJump)) Nil
+            else {
+              def wrapInDefaultLabelDef(cd: CaseDef): CaseDef =
+                if (needDefaultLabel) deriveCaseDef(cd){ b =>
+                  // TODO: can b.tpe ever be null? can't really use pt, see e.g. pos/t2683 or cps/match1.scala
+                  defaultLabel setInfo MethodType(Nil, if (b.tpe != null) b.tpe else pt)
+                  LabelDef(defaultLabel, Nil, b)
+                } else cd
+
+              val last = collapsed.last
+              if (isDefault(last)) {
+                if (!needDefaultLabel) collapsed
+                else collapsed.init :+ wrapInDefaultLabelDef(last)
+              } else collapsed :+ wrapInDefaultLabelDef(defaultCase())
+            }
+          }
+        }
     }
 
     class RegularSwitchMaker(scrutSym: Symbol, matchFailGenOverride: Option[Tree => Tree], val unchecked: Boolean) extends SwitchMaker {
@@ -3251,11 +3604,11 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
        * if keepGoing is false, the result Some(x) of the naive translation is encoded as matchRes == x
        */
       def matcher(scrut: Tree, scrutSym: Symbol, restpe: Type)(cases: List[Casegen => Tree], matchFailGen: Option[Tree => Tree]): Tree = {
-        val matchEnd = NoSymbol.newLabel(freshName("matchEnd"), NoPosition) setFlag SYNTH_CASE
-        val matchRes = NoSymbol.newValueParameter(newTermName("x"), NoPosition, SYNTHETIC) setInfo restpe.withoutAnnotations //
+        val matchEnd = newSynthCaseLabel("matchEnd")
+        val matchRes = NoSymbol.newValueParameter(newTermName("x"), NoPosition, SYNTHETIC) setInfo restpe.withoutAnnotations
         matchEnd setInfo MethodType(List(matchRes), restpe)
 
-        def newCaseSym = NoSymbol.newLabel(freshName("case"), NoPosition) setInfo MethodType(Nil, restpe) setFlag SYNTH_CASE
+        def newCaseSym = newSynthCaseLabel("case") setInfo MethodType(Nil, restpe)
         var _currCase = newCaseSym
 
         val caseDefs = cases map { (mkCase: Casegen => Tree) =>
@@ -3263,7 +3616,7 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
           val nextCase = newCaseSym
           _currCase = nextCase
 
-          LabelDef(currCase, Nil, mkCase(new OptimizedCasegen(matchEnd, nextCase, restpe)))
+          LabelDef(currCase, Nil, mkCase(new OptimizedCasegen(matchEnd, nextCase)))
         }
 
         // must compute catchAll after caseLabels (side-effects nextCase)
@@ -3288,14 +3641,14 @@ trait PatternMatching extends Transform with TypingTransformers with ast.TreeDSL
         )
       }
 
-      class OptimizedCasegen(matchEnd: Symbol, nextCase: Symbol, restpe: Type) extends CommonCodegen with Casegen {
+      class OptimizedCasegen(matchEnd: Symbol, nextCase: Symbol) extends CommonCodegen with Casegen {
         def matcher(scrut: Tree, scrutSym: Symbol, restpe: Type)(cases: List[Casegen => Tree], matchFailGen: Option[Tree => Tree]): Tree =
           optimizedCodegen.matcher(scrut, scrutSym, restpe)(cases, matchFailGen)
 
         // only used to wrap the RHS of a body
         // res: T
         // returns MatchMonad[T]
-        def one(res: Tree): Tree = matchEnd APPLY (_asInstanceOf(res, restpe)) // need cast for GADT magic
+        def one(res: Tree): Tree = matchEnd APPLY (res) // a jump to a case label is special-cased in typedApply
         protected def zero: Tree = nextCase APPLY ()
 
         // prev: MatchMonad[T]

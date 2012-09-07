@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2007-2011 LAMP/EPFL
+ * Copyright 2007-2012 LAMP/EPFL
  * @author  Manohar Jonnalagedda
  */
 
@@ -113,6 +113,18 @@ abstract class Comment {
 
   /** A set of diagram directives for the content diagram */
   def contentDiagram: List[String]
+
+  /** The group this member is part of */
+  def group: Option[String]
+
+  /** Member group descriptions */
+  def groupDesc: Map[String,Body]
+
+  /** Member group names (overriding the short tag) */
+  def groupNames: Map[String,String]
+
+  /** Member group priorities */
+  def groupPrio: Map[String,Int]
 
   override def toString =
     body.toString + "\n" +

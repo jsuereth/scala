@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author Paul Phillips
  */
 
@@ -43,8 +43,6 @@ object Path {
     if (i < 0) ""
     else name.substring(i + 1).toLowerCase
   }
-  // [Eugene++] I hope that noone relied on this method
-//  def isJarOrZip(f: Path, examineFile: Boolean = true) = Jar.isJarOrZip(f, examineFile)
 
   // not certain these won't be problematic, but looks good so far
   implicit def string2path(s: String): Path = apply(s)
@@ -78,7 +76,7 @@ object Path {
     else new Path(jfile)
 
   /** Avoiding any shell/path issues by only using alphanumerics. */
-  private[io] def randomPrefix = alphanumeric take 6 mkString
+  private[io] def randomPrefix = alphanumeric take 6 mkString ""
   private[io] def fail(msg: String) = throw FileOperationException(msg)
 }
 import Path._

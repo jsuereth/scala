@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * Author: Paul Phillips
  */
 
@@ -402,7 +402,7 @@ trait Patterns extends ast.TreeDSL {
       case _                                => toPats(args)
     }
 
-    def resTypes = analyzer.unapplyTypeList(unfn.symbol, unfn.tpe)
+    def resTypes = analyzer.unapplyTypeList(unfn.symbol, unfn.tpe, args.length)
     def resTypesString = resTypes match {
       case Nil  => "Boolean"
       case xs   => xs.mkString(", ")

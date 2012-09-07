@@ -1,13 +1,13 @@
 package scala.collection.slick
 
 object QueryableMacros{
-  def map[T:c.TypeTag, S:c.TypeTag]
-         (c: scala.reflect.makro.Context)
+  def map[T:c.AbsTypeTag, S:c.AbsTypeTag]
+         (c: scala.reflect.macros.Context)
          (projection: c.Expr[T => S])
          : c.Expr[scala.collection.slick.Queryable[S]] = {
     import c.universe._
     val code = EmptyTree
-    c.reify{
+    c.universe.reify{
       Queryable.factory[S]( code.asInstanceOf[reflect.runtime.universe.Tree] )
     }
   }

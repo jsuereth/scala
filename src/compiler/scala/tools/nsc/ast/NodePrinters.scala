@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -145,8 +145,7 @@ abstract class NodePrinters {
       str.toString
     }
     def printModifiers(tree: MemberDef) {
-      // [Eugene++] there's most likely a bug here (?)
-      // see `Printers.printAnnotations` for more information
+      // SI-5885: by default this won't print annotations of not yet initialized symbols
       val annots0 = tree.symbol.annotations match {
         case Nil  => tree.mods.annotations
         case xs   => xs map annotationInfoToString

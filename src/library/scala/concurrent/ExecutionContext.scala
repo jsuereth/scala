@@ -12,6 +12,7 @@ package scala.concurrent
 import java.util.concurrent.{ ExecutorService, Executor }
 import scala.concurrent.util.Duration
 import scala.annotation.implicitNotFound
+import scala.util.Try
 
 /**
  * An `ExecutionContext` is an abstraction over an entity that can execute program logic.
@@ -27,6 +28,12 @@ trait ExecutionContext {
    */
   def reportFailure(t: Throwable): Unit
   
+  /** Prepares for the execution of a task. Returns the prepared
+   *  execution context. A valid implementation of `prepare` is one
+   *  that simply returns `this`.
+   */
+  def prepare(): ExecutionContext = this
+
 }
 
 /**
@@ -43,11 +50,6 @@ trait ExecutionContextExecutorService extends ExecutionContextExecutor with Exec
 /** Contains factory methods for creating execution contexts.
  */
 object ExecutionContext {
-  /**
-   * The `ExecutionContext` associated with the current `Thread`
-   */
-  val currentExecutionContext: ThreadLocal[ExecutionContext] = new ThreadLocal //FIXME might want to set the initial value to an executionContext that throws an exception on execute and warns that it's not set
-
   /**
    * This is the explicit global ExecutionContext,
    * call this when you want to provide the global ExecutionContext explicitly
@@ -82,7 +84,7 @@ object ExecutionContext {
   
   /** The default reporter simply prints the stack trace of the `Throwable` to System.err.
    */
-  def defaultReporter: Throwable => Unit = { case t => t.printStackTrace() }
+  def defaultReporter: Throwable => Unit = (t: Throwable) => t.printStackTrace()
 }
 
 

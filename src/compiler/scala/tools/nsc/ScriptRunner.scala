@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -199,7 +199,7 @@ class ScriptRunner extends HasCompileSocket {
     scriptArgs: List[String]): Either[Throwable, Boolean] =
   {
     try Right(runScript(settings, scriptFile, scriptArgs))
-    catch { case e => Left(unwrap(e)) }
+    catch { case e: Throwable => Left(unwrap(e)) }
   }
 
   /** Run a command

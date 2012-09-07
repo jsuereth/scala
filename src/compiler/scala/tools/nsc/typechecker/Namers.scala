@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -192,6 +192,10 @@ trait Namers extends MethodSynthesis {
       if (!allowsOverload(sym)) {
         val prev = scope.lookupEntry(sym.name)
         if ((prev ne null) && prev.owner == scope && conflict(sym, prev.sym)) {
+          if (sym.isSynthetic || prev.sym.isSynthetic) {
+            handleSyntheticNameConflict(sym, prev.sym)
+            handleSyntheticNameConflict(prev.sym, sym)
+          }
           DoubleDefError(sym, prev.sym)
           sym setInfo ErrorType
           scope unlink prev.sym // let them co-exist...
@@ -200,6 +204,14 @@ trait Namers extends MethodSynthesis {
         }
       }
       scope enter sym
+    }
+
+    /** Logic to handle name conflicts of synthetically generated symbols
+     *  We handle right now: t6227
+     */
+    def handleSyntheticNameConflict(sym1: Symbol, sym2: Symbol) = {
+      if (sym1.isImplicit && sym1.isMethod && sym2.isModule && sym2.companionClass.isCaseClass)
+        validate(sym2.companionClass)
     }
 
     def enterSym(tree: Tree): Context = {
@@ -835,13 +847,15 @@ trait Namers extends MethodSynthesis {
 
       // add the copy method to case classes; this needs to be done here, not in SyntheticMethods, because
       // the namer phase must traverse this copy method to create default getters for its parameters.
-      // here, clazz is the ClassSymbol of the case class (not the module).
-      if (clazz.isClass && !clazz.hasModuleFlag) {
+      // here, clazz is the ClassSymbol of the case class (not the module). (!clazz.hasModuleFlag) excludes
+      // the moduleClass symbol of the companion object when the companion is a "case object".
+      if (clazz.isCaseClass && !clazz.hasModuleFlag) {
         val modClass = companionSymbolOf(clazz, context).moduleClass
         modClass.attachments.get[ClassForCaseCompanionAttachment] foreach { cma =>
           val cdef = cma.caseClass
           def hasCopy(decls: Scope) = (decls lookup nme.copy) != NoSymbol
-          if (cdef.mods.isCase && !hasCopy(decls) &&
+          // SI-5956 needs (cdef.symbol == clazz): there can be multiple class symbols with the same name
+          if (cdef.symbol == clazz && !hasCopy(decls) &&
                   !parents.exists(p => hasCopy(p.typeSymbol.info.decls)) &&
                   !parents.flatMap(_.baseClasses).distinct.exists(bc => hasCopy(bc.info.decls)))
             addCopyMethod(cdef, templateNamer)
@@ -971,7 +985,7 @@ trait Namers extends MethodSynthesis {
       // Add a () parameter section if this overrides some method with () parameters.
       if (clazz.isClass && vparamss.isEmpty && overriddenSymbol.alternatives.exists(
         _.info.isInstanceOf[MethodType])) {
-        vparamSymss = List(List())
+        vparamSymss = ListOfNil
       }
       mforeach(vparamss) { vparam =>
         if (vparam.tpt.isEmpty) {
@@ -981,11 +995,15 @@ trait Namers extends MethodSynthesis {
       }
       addDefaultGetters(meth, vparamss, tparams, overriddenSymbol)
 
+      // fast track macros, i.e. macros defined inside the compiler, are hardcoded
+      // hence we make use of that and let them have whatever right-hand side they need
+      // (either "macro ???" as they used to or just "???" to maximally simplify their compilation)
+      if (fastTrack contains ddef.symbol) ddef.symbol setFlag MACRO
+
       // macro defs need to be typechecked in advance
       // because @macroImpl annotation only gets assigned during typechecking
-      // otherwise we might find ourselves in the situation when we specified -Xmacro-fallback-classpath
-      // but macros still don't expand
-      // that might happen because macro def doesn't have its link a macro impl yet
+      // otherwise macro defs wouldn't be able to robustly coexist with their clients
+      // because a client could be typechecked before a macro def that it uses
       if (ddef.symbol.isTermMacro) {
         val pt = resultPt.substSym(tparamSyms, tparams map (_.symbol))
         typer.computeMacroDefType(ddef, pt)
@@ -1026,7 +1044,7 @@ trait Namers extends MethodSynthesis {
       var baseParamss = (vparamss, overridden.tpe.paramss) match {
         // match empty and missing parameter list
         case (Nil, List(Nil)) => Nil
-        case (List(Nil), Nil) => List(Nil)
+        case (List(Nil), Nil) => ListOfNil
         case (_, paramss)     => paramss
       }
       assert(
@@ -1212,8 +1230,8 @@ trait Namers extends MethodSynthesis {
         if (!annotated.isInitialized) tree match {
           case defn: MemberDef =>
             val ainfos = defn.mods.annotations filterNot (_ eq null) map { ann =>
-              // need to be lazy, #1782
-              AnnotationInfo lazily (typer typedAnnotation ann)
+              // need to be lazy, #1782. beforeTyper to allow inferView in annotation args, SI-5892.
+              AnnotationInfo lazily beforeTyper(typer typedAnnotation ann)
             }
             if (ainfos.nonEmpty) {
               annotated setAnnotations ainfos
@@ -1384,6 +1402,7 @@ trait Namers extends MethodSynthesis {
           fail(ImplicitAtToplevel)
       }
       if (sym.isClass) {
+        checkNoConflict(IMPLICIT, CASE)
         if (sym.isAnyOverride && !sym.hasFlag(TRAIT))
           fail(OverrideClass)
       } else {

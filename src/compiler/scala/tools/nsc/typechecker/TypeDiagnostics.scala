@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Paul Phillips
  */
 
@@ -252,6 +252,13 @@ trait TypeDiagnostics {
     }
     ""    // no elaborable variance situation found
   }
+
+  // For found/required errors where AnyRef would have sufficed:
+  // explain in greater detail.
+  def explainAnyVsAnyRef(found: Type, req: Type): String = {
+    if (AnyRefClass.tpe <:< req) notAnyRefMessage(found) else ""
+  }
+
   // TODO - figure out how to avoid doing any work at all
   // when the message will never be seen.  I though context.reportErrors
   // being false would do that, but if I return "<suppressed>" under
@@ -261,7 +268,10 @@ trait TypeDiagnostics {
       ";\n found   : " + found.toLongString + existentialContext(found) + explainAlias(found) +
        "\n required: " + req + existentialContext(req) + explainAlias(req)
     )
-    withDisambiguation(Nil, found, req)(baseMessage) + explainVariance(found, req)
+    (   withDisambiguation(Nil, found, req)(baseMessage)
+      + explainVariance(found, req)
+      + explainAnyVsAnyRef(found, req)
+    )
   }
 
   case class TypeDiag(tp: Type, sym: Symbol) extends Ordered[TypeDiag] {
@@ -401,7 +411,11 @@ trait TypeDiagnostics {
 
     object checkDead {
       private var expr: Symbol = NoSymbol
-      private def exprOK = expr != Object_synchronized
+
+      private def exprOK =
+        (expr != Object_synchronized) &&
+        !(expr.isLabel && treeInfo.isSynthCaseSymbol(expr)) // it's okay to jump to matchEnd (or another case) with an argument of type nothing
+
       private def treeOK(tree: Tree) = tree.tpe != null && tree.tpe.typeSymbol == NothingClass
 
       def updateExpr(fn: Tree) = {
@@ -458,7 +472,6 @@ trait TypeDiagnostics {
         case CyclicReference(sym, info: TypeCompleter) =>
           if (context0.owner.isTermMacro) {
             // see comments to TypeSigError for an explanation of this special case
-            // [Eugene] is there a better way?
             throw ex
           } else {
             val pos = info.tree match {

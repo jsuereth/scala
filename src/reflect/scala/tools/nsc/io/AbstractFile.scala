@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -82,7 +82,7 @@ object AbstractFile {
  *   <code>global.settings.encoding.value</code>.
  * </p>
  */
-abstract class AbstractFile extends reflect.internal.AbstractFileApi with Iterable[AbstractFile] {
+abstract class AbstractFile extends Iterable[AbstractFile] {
 
   /** Returns the name of this abstract file. */
   def name: String

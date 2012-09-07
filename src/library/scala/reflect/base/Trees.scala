@@ -1,14 +1,10 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 package scala.reflect
 package base
 
-// [Eugene++] of all reflection APIs, this one is in the biggest need of review and documentation
-
-// Syncnote: Trees are currently not thread-safe.
-// [Eugene++] now when trees are finally abstract types, can we do something for this?
 trait Trees { self: Universe =>
 
   /** The base API that all trees support */
@@ -33,6 +29,9 @@ trait Trees { self: Universe =>
 
   /** Obtains string representation of a tree */
   protected def treeToString(tree: Tree): String
+
+  /** Obtains the type of the tree (we intentionally don't expose `tree.tpe` in base) */
+  protected def treeType(tree: Tree): Type
 
   /** Tree is the basis for scala's abstract syntax. The nodes are
    *  implemented as case classes, and the parameters which initialize
@@ -78,7 +77,6 @@ trait Trees { self: Universe =>
    *  example is Parens, which is eliminated during parsing.
    */
   type Tree >: Null <: TreeBase
-  // [Eugene++] todo. discuss nullability of abstract types
 
   /** A tag that preserves the identity of the `Tree` abstract type from erasure.
    *  Can be used for pattern matching, instance tests, serialization and likes.
@@ -1357,9 +1355,8 @@ trait Trees { self: Universe =>
 
   /** ... */
   abstract class ModifiersBase {
-    def flags: FlagSet
-    def hasFlag(flags: FlagSet): Boolean
-    def hasAllFlags(flags: FlagSet): Boolean
+    def flags: FlagSet // default: NoFlags
+    def hasFlag(flag: FlagSet): Boolean
     def privateWithin: Name  // default: EmptyTypeName
     def annotations: List[Tree] // default: List()
     def mapAnnotations(f: List[Tree] => List[Tree]): Modifiers =
@@ -1379,7 +1376,6 @@ trait Trees { self: Universe =>
   /** ... */
   lazy val NoMods = Modifiers()
 
-  // [Eugene++] temporarily moved here until SI-5863 is fixed
 // ---------------------- factories ----------------------------------------------
 
   /** @param sym       the class symbol

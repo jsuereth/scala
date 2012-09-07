@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author Martin Odersky
  */
 
@@ -47,9 +47,12 @@ abstract class ExplicitOuter extends InfoTransform
     case TypeRef(pre, sym, _)   =>
       val owner = clazz.owner
 
+      //println(s"have same outer $parent $clazz $sym ${sym.owner} $owner $pre")
+
       sym.isClass && owner.isClass &&
-      owner == sym.owner &&
+      (owner isSubClass sym.owner) &&
       owner.thisType =:= pre
+
     case _                      => false
   }
 
@@ -92,7 +95,7 @@ abstract class ExplicitOuter extends InfoTransform
     else findOrElse(clazz.info.decls)(_.outerSource == clazz)(NoSymbol)
   }
   def newOuterAccessor(clazz: Symbol) = {
-    val accFlags = SYNTHETIC | HIDDEN | METHOD | STABLE | ( if (clazz.isTrait) DEFERRED else 0 )
+    val accFlags = SYNTHETIC | ARTIFACT | METHOD | STABLE | ( if (clazz.isTrait) DEFERRED else 0 )
     val sym      = clazz.newMethod(nme.OUTER, clazz.pos, accFlags)
     val restpe   = if (clazz.isTrait) clazz.outerClass.tpe else clazz.outerClass.thisType
 
@@ -101,7 +104,7 @@ abstract class ExplicitOuter extends InfoTransform
     sym setInfo MethodType(Nil, restpe)
   }
   def newOuterField(clazz: Symbol) = {
-    val accFlags = SYNTHETIC | HIDDEN | PARAMACCESSOR | ( if (clazz.isEffectivelyFinal) PrivateLocal else PROTECTED )
+    val accFlags = SYNTHETIC | ARTIFACT | PARAMACCESSOR | ( if (clazz.isEffectivelyFinal) PrivateLocal else PROTECTED )
     val sym      = clazz.newValue(nme.OUTER_LOCAL, clazz.pos, accFlags)
 
     sym setInfo clazz.outerClass.thisType
@@ -374,6 +377,7 @@ abstract class ExplicitOuter extends InfoTransform
       }
     }
 
+    // requires settings.XoldPatmat.value
     def matchTranslation(tree: Match) = {
       val Match(selector, cases) = tree
       var nselector = transform(selector)
@@ -412,7 +416,7 @@ abstract class ExplicitOuter extends InfoTransform
 
       val (checkExhaustive, requireSwitch) = nselector match {
         case Typed(nselector1, tpt) =>
-          val unchecked = treeInfo.isUncheckedAnnotation(tpt.tpe)
+          val unchecked = tpt.tpe hasAnnotation UncheckedClass
           if (unchecked)
             nselector = nselector1
 
@@ -480,7 +484,7 @@ abstract class ExplicitOuter extends InfoTransform
                 val vparamss1 =
                   if (isInner(clazz)) { // (4)
                     val outerParam =
-                      sym.newValueParameter(nme.OUTER, sym.pos) setInfo outerField(clazz).info
+                      sym.newValueParameter(nme.OUTER, sym.pos) setInfo clazz.outerClass.thisType
                     ((ValDef(outerParam) setType NoType) :: vparamss.head) :: vparamss.tail
                   } else vparamss
                 super.transform(copyDefDef(tree)(vparamss = vparamss1))
@@ -493,8 +497,12 @@ abstract class ExplicitOuter extends InfoTransform
           else atPos(tree.pos)(outerPath(outerValue, currentClass.outerClass, sym)) // (5)
 
         case Select(qual, name) =>
-          if (currentClass != sym.owner) // (3)
+          // make not private symbol acessed from inner classes, as well as
+          // symbols accessed from @inline methods
+          if (currentClass != sym.owner ||
+              (sym.owner.enclMethod hasAnnotation ScalaInlineClass))
             sym.makeNotPrivate(sym.owner)
+
           val qsym = qual.tpe.widen.typeSymbol
           if (sym.isProtected && //(4)
               (qsym.isTrait || !(qual.isInstanceOf[Super] || (qsym isSubClass currentClass))))
@@ -516,33 +524,32 @@ abstract class ExplicitOuter extends InfoTransform
           super.transform(treeCopy.Apply(tree, sel, outerVal :: args))
 
         // entry point for pattern matcher translation
-        case mch: Match if (!opt.virtPatmat) => // don't use old pattern matcher as fallback when the user wants the virtualizing one
-          matchTranslation(mch)
+        case m: Match if settings.XoldPatmat.value => // the new pattern matcher runs in its own phase right after typer
+          matchTranslation(m)
 
-        case _ =>
-          if (opt.virtPatmat) { // this turned out to be expensive, hence the hacky `if` and `return`
-            tree match {
-              // for patmatvirtualiser
-              // base.<outer>.eq(o) --> base.$outer().eq(o) if there's an accessor, else the whole tree becomes TRUE
-              // TODO remove the synthetic `<outer>` method from outerFor??
-              case Apply(eqsel@Select(eqapp@Apply(sel@Select(base, outerAcc), Nil), eq), args)  if outerAcc == nme.OUTER_SYNTH =>
-                val outerFor = sel.symbol.owner.toInterface // TODO: toInterface necessary?
-                val acc = outerAccessor(outerFor)
-                if(acc == NoSymbol) {
-                  // println("WARNING: no outer for "+ outerFor)
-                  return transform(TRUE) // urgh... drop condition if there's no accessor
-                } else {
-                  // println("(base, acc)= "+(base, acc))
-                  val outerSelect = localTyper typed Apply(Select(base, acc), Nil)
-                  // achieves the same as: localTyper typed atPos(tree.pos)(outerPath(base, base.tpe.typeSymbol, outerFor.outerClass))
-                  // println("(b, tpsym, outerForI, outerFor, outerClass)= "+ (base, base.tpe.typeSymbol, outerFor, sel.symbol.owner, outerFor.outerClass))
-                  // println("outerSelect = "+ outerSelect)
-                  return transform(treeCopy.Apply(tree, treeCopy.Select(eqsel, outerSelect, eq), args))
-                }
-              case _ =>
-            }
+        // for the new pattern matcher
+        // base.<outer>.eq(o) --> base.$outer().eq(o) if there's an accessor, else the whole tree becomes TRUE
+        // TODO remove the synthetic `<outer>` method from outerFor??
+        case Apply(eqsel@Select(eqapp@Apply(sel@Select(base, nme.OUTER_SYNTH), Nil), eq), args) if !settings.XoldPatmat.value =>
+          val outerFor = sel.symbol.owner.toInterface // TODO: toInterface necessary?
+          val acc = outerAccessor(outerFor)
+
+          if (acc == NoSymbol ||
+              // since we can't fix SI-4440 properly (we must drop the outer accessors of final classes when there's no immediate reference to them in sight)
+              // at least don't crash... this duplicates maybeOmittable from constructors
+              (acc.owner.isEffectivelyFinal && !acc.isOverridingSymbol)) {
+            unit.uncheckedWarning(tree.pos, "The outer reference in this type test cannot be checked at run time.")
+            return transform(TRUE) // urgh... drop condition if there's no accessor (or if it may disappear after constructors)
+          } else {
+            // println("(base, acc)= "+(base, acc))
+            val outerSelect = localTyper typed Apply(Select(base, acc), Nil)
+            // achieves the same as: localTyper typed atPos(tree.pos)(outerPath(base, base.tpe.typeSymbol, outerFor.outerClass))
+            // println("(b, tpsym, outerForI, outerFor, outerClass)= "+ (base, base.tpe.typeSymbol, outerFor, sel.symbol.owner, outerFor.outerClass))
+            // println("outerSelect = "+ outerSelect)
+            return transform(treeCopy.Apply(tree, treeCopy.Select(eqsel, outerSelect, eq), args))
           }
 
+        case _ =>
           if (settings.Xmigration28.value) tree match {
             case TypeApply(fn @ Select(qual, _), args) if fn.symbol == Object_isInstanceOf || fn.symbol == Any_isInstanceOf =>
               if (isArraySeqTest(qual.tpe, args.head.tpe))

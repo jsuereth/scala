@@ -1,5 +1,5 @@
 /* NEST (New Scala Test)
- * Copyright 2007-2011 LAMP/EPFL
+ * Copyright 2007-2012 LAMP/EPFL
  * @author Philipp Haller
  */
 
@@ -78,3 +78,4 @@ case class SpecializedTestFile(file: JFile, fileManager: FileManager) extends Te
 }
 case class PresentationTestFile(file: JFile, fileManager: FileManager) extends TestFile("presentation")
 case class AntTestFile(file: JFile, fileManager: FileManager) extends TestFile("ant")
+case class InstrumentedTestFile(file: JFile, fileManager: FileManager) extends TestFile("instrumented")

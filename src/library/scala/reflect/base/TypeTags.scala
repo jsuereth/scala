@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -99,8 +99,9 @@ import language.implicitConversions
  * 4) Certain manifest functions (such as `<:<`, `>:>` and `typeArguments`) weren't included in the tag API.
  *    Consider using reflection API provided by Java (for classes) and Scala (for types) instead.
  */
-// [Eugene++] implement serialization for typetags
 trait TypeTags { self: Universe =>
+
+  import definitions._
 
   /**
    * If an implicit value of type u.AbsTypeTag[T] is required, the compiler will make one up on demand.
@@ -164,11 +165,12 @@ trait TypeTags { self: Universe =>
   }
 
   private class AbsTypeTagImpl[T](val mirror: Mirror, val tpec: TypeCreator) extends AbsTypeTag[T] {
-    lazy val tpe: Type = tpec[self.type](mirror)
+    lazy val tpe: Type = tpec(mirror)
     def in[U <: Universe with Singleton](otherMirror: MirrorOf[U]): U # AbsTypeTag[T] = {
       val otherMirror1 = otherMirror.asInstanceOf[MirrorOf[otherMirror.universe.type]]
       otherMirror.universe.AbsTypeTag[T](otherMirror1, tpec)
     }
+    private def writeReplace(): AnyRef = new SerializedTypeTag(tpec, concrete = false)
   }
 
   /**
@@ -233,18 +235,43 @@ trait TypeTags { self: Universe =>
       val otherMirror1 = otherMirror.asInstanceOf[MirrorOf[otherMirror.universe.type]]
       otherMirror.universe.TypeTag[T](otherMirror1, tpec)
     }
+    private def writeReplace(): AnyRef = new SerializedTypeTag(tpec, concrete = true)
   }
 
-  private class PredefTypeTag[T](_tpe: Type, copyIn: Universe => Universe # TypeTag[T]) extends TypeTagImpl[T](rootMirror, null) {
+  private class PredefTypeCreator[T](copyIn: Universe => Universe # TypeTag[T]) extends TypeCreator {
+    def apply[U <: Universe with Singleton](m: MirrorOf[U]): U # Type = {
+      copyIn(m.universe).asInstanceOf[U # TypeTag[T]].tpe
+    }
+  }
+
+  private class PredefTypeTag[T](_tpe: Type, copyIn: Universe => Universe # TypeTag[T]) extends TypeTagImpl[T](rootMirror, new PredefTypeCreator(copyIn)) {
     override lazy val tpe: Type = _tpe
-    override def in[U <: Universe with Singleton](otherMirror: MirrorOf[U]): U # TypeTag[T] =
-      copyIn(otherMirror.universe).asInstanceOf[U # TypeTag[T]]
-    private def readResolve() = copyIn(self)
+    private def writeReplace(): AnyRef = new SerializedTypeTag(tpec, concrete = true)
   }
 
   // incantations
+  def absTypeTag[T](implicit attag: AbsTypeTag[T]) = attag
   def typeTag[T](implicit ttag: TypeTag[T]) = ttag
 
   // big thanks to Viktor Klang for this brilliant idea!
+  def absTypeOf[T](implicit attag: AbsTypeTag[T]): Type = attag.tpe
   def typeOf[T](implicit ttag: TypeTag[T]): Type = ttag.tpe
+}
+
+private[scala] class SerializedTypeTag(var tpec: TypeCreator, var concrete: Boolean) extends Serializable {
+  private def writeObject(out: java.io.ObjectOutputStream): Unit = {
+    out.writeObject(tpec)
+    out.writeBoolean(concrete)
+  }
+
+  private def readObject(in: java.io.ObjectInputStream): Unit = {
+    tpec = in.readObject().asInstanceOf[TypeCreator]
+    concrete = in.readBoolean()
+  }
+
+  private def readResolve(): AnyRef = {
+    import scala.reflect.basis._
+    if (concrete) TypeTag(rootMirror, tpec)
+    else AbsTypeTag(rootMirror, tpec)
+  }
 }

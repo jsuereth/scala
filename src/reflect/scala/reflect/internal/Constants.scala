@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -221,7 +221,12 @@ trait Constants extends api.Constants {
       tag match {
         case NullTag   => "null"
         case StringTag => "\"" + escape(stringValue) + "\""
-        case ClazzTag  => "classOf[" + signature(typeValue) + "]"
+        case ClazzTag  =>
+          def show(tpe: Type) = "classOf[" + signature(tpe) + "]"
+          typeValue match {
+            case ErasedValueType(orig) => show(orig)
+            case _ => show(typeValue)
+          }
         case CharTag   => "'" + escapedChar(charValue) + "'"
         case LongTag   => longValue.toString() + "L"
         case EnumTag   => symbolValue.name.toString()

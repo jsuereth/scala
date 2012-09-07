@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Iulian Dragos
  */
 
@@ -727,7 +727,8 @@ abstract class GenJVM extends SubComponent with GenJVMUtil with GenAndroid with 
       // without it.  This is particularly bad because the availability of
       // generic information could disappear as a consequence of a seemingly
       // unrelated change.
-         sym.isHidden
+         settings.Ynogenericsig.value
+      || sym.isArtifact
       || sym.isLiftedMethod
       || sym.isBridge
       || (sym.ownerChain exists (_.isImplClass))
@@ -865,7 +866,7 @@ abstract class GenJVM extends SubComponent with GenJVMUtil with GenAndroid with 
 
     def genField(f: IField) {
       debuglog("Adding field: " + f.symbol.fullName)
-      
+
       val jfield = jclass.addNewField(
         javaFieldFlags(f.symbol),
         javaName(f.symbol),
@@ -1020,6 +1021,8 @@ abstract class GenJVM extends SubComponent with GenJVMUtil with GenAndroid with 
 
        	  method = m
        	  jmethod = clinitMethod
+
+          computeLocalVarsIndex(m)
        	  genCode(m)
        	case None =>
           legacyStaticInitializer(cls, clinit)
@@ -1121,7 +1124,9 @@ abstract class GenJVM extends SubComponent with GenJVMUtil with GenAndroid with 
           log("No forwarder for " + m + " due to conflict with " + linkedClass.info.member(m.name))
         else {
           log("Adding static forwarder for '%s' from %s to '%s'".format(m, className, moduleClass))
-          addForwarder(jclass, moduleClass, m)
+          if (m.isAccessor && m.accessed.hasStaticAnnotation) {
+            log("@static: accessor " + m + ", accessed: " + m.accessed)
+          } else addForwarder(jclass, moduleClass, m)
         }
       }
     }
@@ -1955,7 +1960,7 @@ abstract class GenJVM extends SubComponent with GenJVMUtil with GenAndroid with 
     // Nested objects won't receive ACC_FINAL in order to allow for their overriding.
 
     val finalFlag = (
-         (sym.hasFlag(Flags.FINAL) || isTopLevelModule(sym))
+         (((sym.rawflags & Flags.FINAL) != 0) || isTopLevelModule(sym))
       && !sym.enclClass.isInterface
       && !sym.isClassConstructor
       && !sym.isMutable   // lazy vals and vars both
@@ -1972,7 +1977,7 @@ abstract class GenJVM extends SubComponent with GenJVMUtil with GenAndroid with 
       if (finalFlag && !sym.hasAbstractFlag) ACC_FINAL else 0,
       if (sym.isStaticMember) ACC_STATIC else 0,
       if (sym.isBridge) ACC_BRIDGE | ACC_SYNTHETIC else 0,
-      if (sym.isHidden) ACC_SYNTHETIC else 0,
+      if (sym.isArtifact) ACC_SYNTHETIC else 0,
       if (sym.isClass && !sym.isInterface) ACC_SUPER else 0,
       if (sym.isVarargsMethod) ACC_VARARGS else 0,
       if (sym.hasFlag(Flags.SYNCHRONIZED)) JAVA_ACC_SYNCHRONIZED else 0

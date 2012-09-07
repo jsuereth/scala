@@ -14,4 +14,3 @@ trait FlagSets { self: Universe =>
   /** The empty set of flags */
   val NoFlags: FlagSet
 }
-

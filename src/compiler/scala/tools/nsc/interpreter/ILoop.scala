@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author Alexander Spoon
  */
 
@@ -25,7 +25,7 @@ import ScalaClassLoader._
 import scala.tools.util._
 import language.{implicitConversions, existentials}
 import scala.reflect.{ClassTag, classTag}
-import scala.tools.reflect.StdTags._
+import scala.tools.reflect.StdRuntimeTags._
 
 /** The Scala interactive shell.  It provides a read-eval-print loop
  *  around the Interpreter class.
@@ -438,7 +438,10 @@ class ILoop(in0: Option[BufferedReader], protected val out: JPrintWriter)
   }
 
   private def warningsCommand(): Result = {
-    intp.lastWarnings foreach { case (pos, msg) => intp.reporter.warning(pos, msg) }
+    if (intp.lastWarnings.isEmpty)
+      "Can't find any cached warnings."
+    else
+      intp.lastWarnings foreach { case (pos, msg) => intp.reporter.warning(pos, msg) }
   }
 
   private def javapCommand(line: String): Result = {

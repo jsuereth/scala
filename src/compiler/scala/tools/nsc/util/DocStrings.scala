@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2006-2011 LAMP/EPFL
+ * Copyright 2006-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -142,6 +142,12 @@ object DocStrings {
         str.substring(start, skipIdent(str, start)) -> section
       }
     }
+
+  /** Optionally start and end index of return section in `str`, or `None`
+   *  if `str` does not have a @group. */
+  def groupDoc(str: String, sections: List[(Int, Int)]): Option[(Int, Int)] =
+    sections find (startsWithTag(str, _, "@group"))
+
 
   /** Optionally start and end index of return section in `str`, or `None`
    *  if `str` does not have a @return.

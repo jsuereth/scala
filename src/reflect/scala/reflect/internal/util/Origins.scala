@@ -1,5 +1,5 @@
 /* NSC -- new scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author Paul Phillips
  */
 
@@ -96,7 +96,7 @@ object Origins {
     || (el.getClassName startsWith "java.lang.")
   )
   private def findCutoff() = {
-    val cutoff = Thread.currentThread.getStackTrace dropWhile preCutoff head;
+    val cutoff = (Thread.currentThread.getStackTrace dropWhile preCutoff).head
     OriginId(cutoff.getClassName, cutoff.getMethodName)
   }
 

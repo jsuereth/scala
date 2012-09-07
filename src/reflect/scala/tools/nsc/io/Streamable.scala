@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author Paul Phillips
  */
 
@@ -112,7 +112,7 @@ object Streamable {
     finally stream.close()
 
   def bytes(is: => InputStream): Array[Byte] =
-    new Bytes { def inputStream() = is } toByteArray
+    (new Bytes { def inputStream() = is }).toByteArray
 
   def slurp(is: => InputStream)(implicit codec: Codec): String =
     new Chars { def inputStream() = is } slurp codec

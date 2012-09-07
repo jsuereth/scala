@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 package scala.reflect
@@ -108,6 +108,8 @@ trait Trees extends base.Trees { self: Universe =>
      */
     def duplicate: this.type
   }
+
+  override protected def treeType(tree: Tree) = tree.tpe
 
   override type TermTree >: Null <: Tree with TermTreeApi
 
@@ -640,8 +642,16 @@ trait Trees extends base.Trees { self: Universe =>
   abstract class Transformer {
     val treeCopy: TreeCopier = newLazyTreeCopier
     protected[scala] var currentOwner: Symbol = rootMirror.RootClass
-    protected def currentMethod = currentOwner.enclosingMethod
-    protected def currentClass = currentOwner.enclosingClass
+    protected def currentMethod = {
+      def enclosingMethod(sym: Symbol): Symbol =
+        if (sym.isMethod || sym == NoSymbol) sym else enclosingMethod(sym.owner)
+      enclosingMethod(currentOwner)
+    }
+    protected def currentClass = {
+      def enclosingClass(sym: Symbol): Symbol =
+        if (sym.isClass || sym == NoSymbol) sym else enclosingClass(sym.owner)
+      enclosingClass(currentOwner)
+    }
 //    protected def currentPackage = currentOwner.enclosingTopLevelClass.owner
     def transform(tree: Tree): Tree = itransform(this, tree)
 
@@ -683,7 +693,7 @@ trait Trees extends base.Trees { self: Universe =>
 
   type Modifiers >: Null <: ModifiersApi
 
-  abstract class ModifiersApi extends ModifiersBase with HasFlagsApi
+  abstract class ModifiersApi extends ModifiersBase
 
 }
 

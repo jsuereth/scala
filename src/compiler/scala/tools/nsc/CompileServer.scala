@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -154,7 +154,7 @@ class StandardCompileServer extends SocketServer {
         case ex @ FatalError(msg) =>
           reporter.error(null, "fatal error: " + msg)
           clearCompiler()
-        case ex =>
+        case ex: Throwable =>
           warn("Compile server encountered fatal condition: " + ex)
           shutdown = true
           throw ex

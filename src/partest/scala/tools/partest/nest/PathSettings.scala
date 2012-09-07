@@ -1,5 +1,5 @@
 /* NEST (New Scala Test)
- * Copyright 2007-2011 LAMP/EPFL
+ * Copyright 2007-2012 LAMP/EPFL
  */
 
 package scala.tools.partest
@@ -48,6 +48,12 @@ object PathSettings {
       orElse findJar(Directory(testRoot / "files" / "codelib"), "code") // work with --srcpath pending
       getOrElse sys.error("No code.jar found in %s".format(srcCodeLibDir))
   )
+
+  lazy val instrumentationAgentLib: File = {
+    findJar(buildPackLibDir.files, "scala-partest-javaagent") getOrElse {
+      sys.error("No partest-javaagent jar found in '%s' or '%s'".format(buildPackLibDir, srcLibDir))
+    }
+  }
 
   // Directory <root>/build
   lazy val buildDir: Directory = {

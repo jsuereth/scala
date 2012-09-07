@@ -1,5 +1,5 @@
 /* NSC -- new Scala compiler
- * Copyright 2005-2011 LAMP/EPFL
+ * Copyright 2005-2012 LAMP/EPFL
  * @author  Martin Odersky
  */
 
@@ -34,8 +34,7 @@ abstract class SymbolLoaders {
   /** Enter class with given `name` into scope of `root`
    *  and give them `completer` as type.
    */
-  def enterClass(root: Symbol, name: String, completer: SymbolLoader): Symbol = {
-    val owner = root.ownerOfNewSymbols
+  def enterClass(owner: Symbol, name: String, completer: SymbolLoader): Symbol = {
     val clazz = owner.newClass(newTypeName(name))
     clazz setInfo completer
     enterIfNew(owner, clazz, completer)
@@ -44,8 +43,7 @@ abstract class SymbolLoaders {
   /** Enter module with given `name` into scope of `root`
    *  and give them `completer` as type.
    */
-  def enterModule(root: Symbol, name: String, completer: SymbolLoader): Symbol = {
-    val owner = root.ownerOfNewSymbols
+  def enterModule(owner: Symbol, name: String, completer: SymbolLoader): Symbol = {
     val module = owner.newModule(newTermName(name))
     module setInfo completer
     module.moduleClass setInfo moduleClassLoader
@@ -114,11 +112,23 @@ abstract class SymbolLoaders {
     enterClassAndModule(root, name, new SourcefileLoader(src))
   }
 
+  /** The package objects of scala and scala.reflect should always
+   *  be loaded in binary if classfiles are available, even if sourcefiles
+   *  are newer. Late-compiling these objects from source leads to compilation
+   *  order issues.
+   *  Note: We do a name-base comparison here because the method is called before we even
+   *  have ReflectPackage defined.
+   */
+  def binaryOnly(owner: Symbol, name: String): Boolean =
+    name == "package" &&
+    (owner.fullName == "scala" || owner.fullName == "scala.reflect")
+
   /** Initialize toplevel class and module symbols in `owner` from class path representation `classRep`
    */
   def initializeFromClassPath(owner: Symbol, classRep: ClassPath[platform.BinaryRepr]#ClassRep) {
     ((classRep.binary, classRep.source) : @unchecked) match {
-      case (Some(bin), Some(src)) if platform.needCompile(bin, src) =>
+      case (Some(bin), Some(src))
+      if platform.needCompile(bin, src) && !binaryOnly(owner, classRep.name) =>
         if (settings.verbose.value) inform("[symloader] picked up newer source file for " + src.path)
         global.loaders.enterToplevelsFromSource(owner, classRep.name, src)
       case (None, Some(src)) =>
@@ -217,15 +227,18 @@ abstract class SymbolLoaders {
       root.setInfo(new PackageClassInfoType(newScope, root))
 
       val sourcepaths = classpath.sourcepaths
-      for (classRep <- classpath.classes if platform.doLoad(classRep)) {
-        initializeFromClassPath(root, classRep)
+      if (!root.isRoot) {
+        for (classRep <- classpath.classes if platform.doLoad(classRep)) {
+          initializeFromClassPath(root, classRep)
+        }
       }
+      if (!root.isEmptyPackageClass) {
+        for (pkg <- classpath.packages) {
+          enterPackage(root, pkg.name, new PackageLoader(pkg))
+        }
 
-      for (pkg <- classpath.packages) {
-        enterPackage(root, pkg.name, new PackageLoader(pkg))
+        openPackageModule(root)
       }
-
-      openPackageModule(root)
     }
   }
 
@@ -237,7 +250,7 @@ abstract class SymbolLoaders {
     protected def description = "class file "+ classfile.toString
 
     protected def doComplete(root: Symbol) {
-      val start = Statistics.startTimer(classReadNanos)
+      val start = if (Statistics.canEnable) Statistics.startTimer(classReadNanos) else null
       classfileParser.parse(classfile, root)
       if (root.associatedFile eq null) {
         root match {
@@ -249,7 +262,7 @@ abstract class SymbolLoaders {
             debuglog("Not setting associatedFile to %s because %s is a %s".format(classfile, root.name, root.shortSymbolClass))
         }
       }
-      Statistics.stopTimer(classReadNanos, start)
+      if (Statistics.canEnable) Statistics.stopTimer(classReadNanos, start)
     }
     override def sourcefile: Option[AbstractFile] = classfileParser.srcfile
   }

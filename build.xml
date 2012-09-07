@@ -289,6 +289,7 @@ INITIALISATION
     <artifact:dependencies pathId="pax.exam.classpath" filesetId="pax.exam.fileset">
       <dependency groupId="org.ops4j.pax.exam" artifactId="pax-exam-container-native" version="${pax.exam.version}"/>
       <dependency groupId="org.ops4j.pax.exam" artifactId="pax-exam-junit4" version="${pax.exam.version}"/>
+      <dependency groupId="org.ops4j.pax.swissbox" artifactId="pax-swissbox-framework" version="1.5.1"/>
       <dependency groupId="junit" artifactId="junit" version="4.10"/>
       <dependency groupId="org.apache.felix" artifactId="org.apache.felix.framework" version="3.2.2"/>
     </artifact:dependencies>

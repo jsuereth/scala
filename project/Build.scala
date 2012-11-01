@@ -91,6 +91,7 @@ object ScalaBuild extends Build with Layers with Packaging with Testing {
   lazy val aaa_root = Project("scala", file(".")) settings(projectSettings: _*) settings(ShaResolve.settings: _*)
 
   // External dependencies used for various projects
+  // TODO - Jline should be here....
   lazy val externalDeps: Setting[_] = libraryDependencies <<= (sbtVersion)(v => 
     Seq(
       "org.apache.ant" % "ant" % "1.8.2",

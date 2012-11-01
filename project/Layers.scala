@@ -20,6 +20,10 @@ trait Layers extends Build {
   /** The root project. */
   def aaa_root: Project
 
+
+  // The ever annoying JLINE
+  val jline = file("lib") / "jline.jar"
+
   /** Creates a reference Scala version that can be used to build other projects.   This takes in the raw
     * library, compiler and fjbg libraries as well as a string representing the layer name (used for compiling the compile-interface).
     */
@@ -84,7 +88,7 @@ trait Layers extends Build {
       resourceGenerators in Compile <+= (resourceManaged, Versions.scalaVersions, skip in Compile, streams) map Versions.generateVersionPropertiesFile("reflect.properties"),
       // TODO - Use depends on *and* SBT's magic dependency mechanisms...
       unmanagedClasspath in Compile <<= Seq(forkjoin, library).map(exportedProducts in Compile in _).join.map(_.flatten),
-      externalDeps,
+      managedClasspath in Compile := Seq(),
       referenceScala
     )
 
@@ -107,6 +111,7 @@ trait Layers extends Build {
       // TODO - Use depends on *and* SBT's magic dependency mechanisms...
       // TODO - jline jar
       unmanagedClasspath in Compile <<= Seq(forkjoin, library, reflect, fjbg, asm).map(exportedProducts in Compile in _).join.map(_.flatten),
+      unmanagedClasspath in Compile += jline,
       externalDeps,
       referenceScala
     )

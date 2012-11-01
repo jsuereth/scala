@@ -30,7 +30,7 @@ object ShaResolve {
        (file, name) <- (files x relativeTo(dir)).par
        uri = name.dropRight(13).replace('\\', '/')       
        jar = dir / uri
-       if !jar.exists || !isValidSha(file)
+       if (!jar.exists) || (!isValidSha(file))
        sha = getShaFromShafile(file)
      } pullFile(jar, sha + "/" + uri, cacheDir, sha, s)
   }
@@ -91,31 +91,37 @@ object ShaResolve {
   }
 
   def convertToHex(data: Array[Byte]): String = {
-    def byteToHex(b: Int) =
+    def halfByteToHex(b: Int) =
       if ((0 <= b) && (b <= 9)) ('0' + b).toChar
       else ('a' + (b-10)).toChar
-    val buf = new StringBuffer
-    for (i <- 0 until data.length) {
-      buf append byteToHex((data(i) >>> 4) & 0x0F)
-      buf append byteToHex(data(i) & 0x0F)
-    }
-    buf.toString
+
+    def byteToHexString(b: Byte): String =
+      "" + halfByteToHex((b >>> 4) & 0x0F) +
+      halfByteToHex(b & 0x0F)
+
+    data map byteToHexString mkString ""
   }
   // Parses a sha file into a file and a sha.
-  def parseShaFile(file: File): (File, String) =
+  def parseShaFile(file: File): (File, String) = {
+    def hasLeadingChar(filename: String): Boolean =
+      (filename startsWith "?") ||
+      (filename startsWith "*")
+
     IO.read(file).split("\\s") match {
-       case Array(sha, filename) if filename.startsWith("?") => (new File(file.getParentFile, filename.drop(1)), sha)
+       case Array(sha, filename) if hasLeadingChar(filename) => (new File(file.getParentFile, filename.drop(1)), sha)
        case Array(sha, filename)                             => (new File(file.getParentFile, filename), sha)
        case _                                                => error(file.getAbsolutePath + " is an invalid sha file")
     }
-  
+  }
 
   def isValidSha(file: File): Boolean =
     try {
       val (jar, sha) = parseShaFile(file)
-      jar.exists && calculateSha(jar) == sha
+      jar.exists && (calculateSha(jar) == sha)
     } catch {
-      case t: Exception => false
+      case t: Exception => 
+       t.printStackTrace()
+       false
     }
      
 

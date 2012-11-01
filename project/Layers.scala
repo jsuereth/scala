@@ -1,7 +1,7 @@
 import sbt._
 import Keys._
-import com.jsuereth.git.GitKeys.gitRunner
 import ScalaBuildKeys.lock
+import Project.Initialize
 
 /** This trait stores all the helper methods to generate layers in Scala's layered build. */
 trait Layers extends Build {
@@ -9,8 +9,6 @@ trait Layers extends Build {
 
   /** Default SBT overrides needed for layered compilation. */
   def settingOverrides: Seq[Setting[_]]
-  /** Reference to the jline project */
-  def jline: Project
   /** Reference to forkjoin library */
   def forkjoin: Project
   /** Reference to Fast-Java-Bytecode-Generator library */
@@ -25,16 +23,15 @@ trait Layers extends Build {
   /** Creates a reference Scala version that can be used to build other projects.   This takes in the raw
     * library, compiler and fjbg libraries as well as a string representing the layer name (used for compiling the compile-interface).
     */
-  def makeScalaReference(layer: String, library: Project, reflect: Project, compiler: Project) =
+  def makeScalaReference(layer: String, library: Project, reflect: Project, compiler: Project): Setting[Task[ScalaInstance]] =
      scalaInstance <<= (appConfiguration in library,
                         version in library,
                         (exportedProducts in library in Compile),
                         (exportedProducts in reflect in Compile),
                         (exportedProducts in compiler in Compile),
                         (exportedProducts in fjbg in Compile),
-                        (fullClasspath in jline in Runtime),
                         (exportedProducts in asm in Runtime)) map {
-    (app, version: String, lib: Classpath, reflect: Classpath, comp: Classpath, fjbg: Classpath, jline: Classpath, asm: Classpath) =>
+    (app, version: String, lib: Classpath, reflect: Classpath, comp: Classpath, fjbg: Classpath, asm: Classpath) =>
       val launcher = app.provider.scalaProvider.launcher
       (lib,comp) match {
          case (Seq(libraryJar), Seq(compilerJar)) =>
@@ -43,7 +40,7 @@ trait Layers extends Build {
              libraryJar.data,
              compilerJar.data,
              launcher,
-             ((fjbg.files ++ jline.files ++ asm.files ++ reflect.files):_*))
+             ((fjbg.files ++ asm.files ++ reflect.files):_*))
          case _ => error("Cannot build a ScalaReference with more than one classpath element")
       }
   }
@@ -52,7 +49,7 @@ trait Layers extends Build {
    * Returns the library project and compiler project from the next layer.
    * Note:  The library and compiler are not *complete* in the sense that they are missing things like "actors" and "fjbg".
    */
-  def makeLayer(layer: String, referenceScala: Setting[Task[ScalaInstance]], autoLock: Boolean = false) : (Project, Project, Project) = {
+  def makeLayer(layer: String, referenceScala: Setting[Task[ScalaInstance]], autoLock: Boolean = false): (Project, Project, Project) = {
     val autoLockSettings: Seq[Setting[_]] = 
       if(autoLock) Seq(compile in Compile <<= (compile in Compile, lock) apply { (c, l) => 
         c flatMapR { cResult =>
@@ -108,7 +105,8 @@ trait Layers extends Build {
           dirs.descendentsExcept( ("*.xml" | "*.html" | "*.gif" | "*.png" | "*.js" | "*.css" | "*.tmpl" | "*.swf" | "*.properties" | "*.txt"),"*.scala").get
       },
       // TODO - Use depends on *and* SBT's magic dependency mechanisms...
-      unmanagedClasspath in Compile <<= Seq(forkjoin, library, reflect, fjbg, jline, asm).map(exportedProducts in Compile in _).join.map(_.flatten),
+      // TODO - jline jar
+      unmanagedClasspath in Compile <<= Seq(forkjoin, library, reflect, fjbg, asm).map(exportedProducts in Compile in _).join.map(_.flatten),
       externalDeps,
       referenceScala
     )

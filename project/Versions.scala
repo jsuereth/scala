@@ -4,8 +4,8 @@ import java.util.Properties
 import scala.util.control.Exception.catching
 import java.lang.{NumberFormatException => NFE}
 import java.io.FileInputStream
-import com.jsuereth.git.GitRunner
-import com.jsuereth.git.GitKeys.gitRunner
+import com.typesafe.sbt.git.GitRunner
+import com.typesafe.sbt.SbtGit.GitKeys.gitRunner
 
 case class VersionInfo(canonical: String,
                        maven: String,

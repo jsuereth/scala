@@ -19,8 +19,7 @@ trait Packaging { self: ScalaBuild.type =>
     genBin <<= genBinTask(genBinRunner, binDir, fullClasspath in Runtime, false),
     binDir in genBinQuick <<= baseDirectory apply (_ / "target" / "bin"),
     // Configure the classpath this way to avoid having .jar files and previous layers on the classpath.
-    fullClasspath in Runtime in genBinQuick <<= Seq(quickComp,quickLib,scalap,actors,swing,fjbg,jline,forkjoin).map(classDirectory in Compile in _).join.map(Attributed.blankSeq),
-    fullClasspath in Runtime in genBinQuick <++= (fullClasspath in Compile in jline),
+    fullClasspath in Runtime in genBinQuick <<= Seq(quickComp,quickLib,scalap,actors,swing,fjbg,forkjoin).map(classDirectory in Compile in _).join.map(Attributed.blankSeq),
     genBinQuick <<= genBinTask(genBinRunner, binDir in genBinQuick, fullClasspath in Runtime in genBinQuick, true),
     runManmakerMan <<= runManmakerTask(fullClasspath in Runtime in manmaker, runner in manmaker, "scala.tools.docutil.EmitManPage", "man1", ".1"),
     runManmakerHtml <<= runManmakerTask(fullClasspath in Runtime in manmaker, runner in manmaker, "scala.tools.docutil.EmitHtml", "doc", ".html"),
@@ -32,16 +31,12 @@ trait Packaging { self: ScalaBuild.type =>
                           runManmakerHtml,
                           packageBin in scalaLibrary in Compile, 
                           packageBin in scalaCompiler in Compile,
-                          packageBin in jline in Compile,
                           packageBin in continuationsPlugin in Compile,
-                          managedClasspath in jline in Compile,
                           packageBin in scalap in Compile) map {
-      (binaries, man, html, lib, comp, jline, continuations, jlineDeps, scalap) =>
-        val jlineDepMap: Seq[(File, String)] = jlineDeps.map(_.data).flatMap(_ x Path.flat) map { case(a,b) => a -> ("lib/"+b) }
-        binaries ++ man ++ html ++ jlineDepMap ++ Seq(
+      (binaries, man, html, lib, comp, continuations, scalap) =>
+        binaries ++ man ++ html ++ Seq(
           lib           -> "lib/scala-library.jar",
           comp          -> "lib/scala-compiler.jar",
-          jline         -> "lib/jline.jar",
           continuations -> "misc/scala-devel/plugins/continuations.jar",
           scalap        -> "lib/scalap.jar"
         )

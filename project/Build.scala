@@ -26,7 +26,7 @@ object ScalaBuild extends Build with Layers with Packaging with Testing {
   // Collections of projects to run 'compile' on.
   lazy val compiledProjects = Seq(quickLib, quickComp, continuationsLibrary, actors, actorsMigration, swing, forkjoin, fjbg)
   // Collection of projects to 'package' and 'publish' together.
-  lazy val packagedBinaryProjects = Seq(scalaLibrary, scalaCompiler, swing, actors, actorsMigration, continuationsPlugin, jline, scalap)
+  lazy val packagedBinaryProjects = Seq(scalaLibrary, scalaCompiler, swing, actors, actorsMigration, continuationsPlugin, scalap)
   lazy val partestRunProjects = Seq(testsuite, continuationsTestsuite)
   
   private def epflPomExtra = (
@@ -130,8 +130,9 @@ object ScalaBuild extends Build with Layers with Packaging with Testing {
   //  (or hopefully so).
   // --------------------------------------------------------------
 
-  // Jline nested project.   Compile this sucker once and be done.
-  lazy val jline = Project("jline", file("src/jline"))
+  // Jline is a pain in the ass.  Ignore it for now until it becomes
+  // a real project for scala.
+  //lazy val jline = Project("jline", file("src/jline"))
   // Fast Java Bytecode Generator (nested in every scala-compiler.jar)
   lazy val fjbg = Project("fjbg", file(".")) settings(settingOverrides : _*)
   // Our wrapped version of msil.

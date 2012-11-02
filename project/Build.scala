@@ -94,8 +94,8 @@ object ScalaBuild extends Build with Layers with Packaging with Testing {
   // TODO - Jline should be here....
   lazy val externalDeps: Setting[_] = libraryDependencies <<= (sbtVersion)(v => 
     Seq(
-      "org.apache.ant" % "ant" % "1.8.2",
-      "org.scala-sbt" % "compiler-interface" % v % "provided"
+      "org.apache.ant" % "ant" % "1.8.2"
+      //"org.scala-sbt" % "compiler-interface" % v % "provided"
     )
   )
 

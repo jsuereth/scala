@@ -34,7 +34,7 @@ trait Layers extends Build {
                         (exportedProducts in reflect in Compile),
                         (exportedProducts in compiler in Compile),
                         (exportedProducts in fjbg in Compile),
-                        (exportedProducts in asm in Runtime)) map {
+                        (exportedProducts in asm in Compile)) map {
     (app, version: String, lib: Classpath, reflect: Classpath, comp: Classpath, fjbg: Classpath, asm: Classpath) =>
       val launcher = app.provider.scalaProvider.launcher
       (lib,comp) match {
@@ -44,7 +44,7 @@ trait Layers extends Build {
              libraryJar.data,
              compilerJar.data,
              launcher,
-             ((fjbg.files ++ asm.files ++ reflect.files):_*))
+             ((fjbg.files ++ asm.files ++ reflect.files ++ Seq(jline)):_*))
          case _ => error("Cannot build a ScalaReference with more than one classpath element")
       }
   }
@@ -54,6 +54,8 @@ trait Layers extends Build {
    * Note:  The library and compiler are not *complete* in the sense that they are missing things like "actors" and "fjbg".
    */
   def makeLayer(layer: String, referenceScala: Setting[Task[ScalaInstance]], autoLock: Boolean = false): (Project, Project, Project) = {
+
+    // Add the ability to automatically lock a project if compilation was succesfull.
     val autoLockSettings: Seq[Setting[_]] = 
       if(autoLock) Seq(compile in Compile <<= (compile in Compile, lock) apply { (c, l) => 
         c flatMapR { cResult =>
@@ -63,44 +65,44 @@ trait Layers extends Build {
       }) 
       else Seq.empty
 
+    // Common settings only needed for bootstrapping.
+    def makeCommonSettings(name: String): Seq[Setting[_]] = 
+      settingOverrides ++
+      autoLockSettings ++
+      Seq(
+        version := layer,
+        scalaSource in Compile <<= (baseDirectory) apply (_ / "src" / name),
+        resourceDirectory in Compile <<= baseDirectory apply (_ / "src" / name),   
+        resourceGenerators in Compile <+= (resourceManaged, Versions.scalaVersions, skip in Compile, streams) map Versions.generateVersionPropertiesFile(name + ".properties"),
+        defaultExcludes in unmanagedResources := ("*.scala" | "*.java" | "*.disabled"),
+        defaultExcludes := ("tests"),
+        defaultExcludes in unmanagedResources := "*.scala",
+        referenceScala
+      )
 
-    val library = Project(layer + "-library", file("."))  settings(settingOverrides: _*) settings(autoLockSettings:_*) settings(
-      version := layer,
+    // Creates a new layered project by name (where name = default src/name location)
+    def LayeredProject(name: String): Project = 
+      Project(layer + "-" + name, file("."))  settings(makeCommonSettings(name): _*)
+ 
+    val library = LayeredProject("library") settings(
       // TODO - use depends on.
       unmanagedClasspath in Compile <<= (exportedProducts in forkjoin in Compile).identity,
       managedClasspath in Compile := Seq(),
-      scalaSource in Compile <<= (baseDirectory) apply (_ / "src" / "library"),
-      resourceDirectory in Compile <<= baseDirectory apply (_ / "src" / "library"),   
-      defaultExcludes in unmanagedResources := ("*.scala" | "*.java" | "*.disabled"),
       // TODO - Allow other scalac option settings.
-      scalacOptions in Compile <++= (scalaSource in Compile) map (src => Seq("-sourcepath", src.getAbsolutePath)),
-      resourceGenerators in Compile <+= (resourceManaged, Versions.scalaVersions, skip in Compile, streams) map Versions.generateVersionPropertiesFile("library.properties"),
-      referenceScala
+      scalacOptions in Compile <++= (scalaSource in Compile) map (src => Seq("-sourcepath", src.getAbsolutePath))
     )
 
     // Define the reflection
-    val reflect = Project(layer + "-reflect", file(".")) settings(settingOverrides:_*) settings(autoLockSettings:_*) settings(
-      version := layer,
-      scalaSource in Compile <<= (baseDirectory) apply (_ / "src" / "reflect"),
-      resourceDirectory in Compile <<= baseDirectory apply (_ / "src" / "reflect"),
-      defaultExcludes := ("tests"),
-      defaultExcludes in unmanagedResources := "*.scala",
-      resourceGenerators in Compile <+= (resourceManaged, Versions.scalaVersions, skip in Compile, streams) map Versions.generateVersionPropertiesFile("reflect.properties"),
+    val reflect = LayeredProject("reflect") settings(
       // TODO - Use depends on *and* SBT's magic dependency mechanisms...
       unmanagedClasspath in Compile <<= Seq(forkjoin, library).map(exportedProducts in Compile in _).join.map(_.flatten),
-      managedClasspath in Compile := Seq(),
-      referenceScala
+      managedClasspath in Compile := Seq()
     )
 
     // Define the compiler
-    val compiler = Project(layer + "-compiler", file(".")) settings(settingOverrides:_*) settings(autoLockSettings:_*) settings(
-      version := layer,
-      scalaSource in Compile <<= (baseDirectory) apply (_ / "src" / "compiler"),
-      resourceDirectory in Compile <<= baseDirectory apply (_ / "src" / "compiler"),
+    val compiler = LayeredProject("compiler") settings(
+      // Note: compiler needs MSIL as well.
       unmanagedSourceDirectories in Compile <+= (baseDirectory) apply (_ / "src" / "msil"),
-      defaultExcludes := ("tests"),
-      defaultExcludes in unmanagedResources := "*.scala",
-      resourceGenerators in Compile <+= (resourceManaged, Versions.scalaVersions, skip in Compile, streams) map Versions.generateVersionPropertiesFile("compiler.properties"),
       // Note, we might be able to use the default task, but for some reason ant was filtering files out.  Not sure what's up, but we'll
       // stick with that for now.
       unmanagedResources in Compile <<= (baseDirectory) map {
@@ -112,8 +114,7 @@ trait Layers extends Build {
       // TODO - jline jar
       unmanagedClasspath in Compile <<= Seq(forkjoin, library, reflect, fjbg, asm).map(exportedProducts in Compile in _).join.map(_.flatten),
       unmanagedClasspath in Compile += jline,
-      externalDeps,
-      referenceScala
+      externalDeps
     )
 
     // Return the generated projects.

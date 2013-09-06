@@ -13,6 +13,7 @@
             "dependencies": [],
             "name": "scala-library",
             "organization": "org.scala-lang"
+
         },
         {
             "artifacts": [
@@ -45,7 +46,7 @@
                     "extension": "jar",
                     "name": "scala-reflect",
                     "organization": "org.scala-lang"
-                }
+                },
                 {
                     "extension": "jar",
                     "name": "scala-xml",
